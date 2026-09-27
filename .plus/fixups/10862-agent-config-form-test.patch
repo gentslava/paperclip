@@ -1,0 +1,20 @@
+diff --git a/ui/src/components/AgentConfigForm.render.test.tsx b/ui/src/components/AgentConfigForm.render.test.tsx
+index 099510746..7d5cb8b93 100644
+--- a/ui/src/components/AgentConfigForm.render.test.tsx
++++ b/ui/src/components/AgentConfigForm.render.test.tsx
+@@ -281,7 +281,6 @@ async function renderForm(
+       mutations: { retry: false },
+     },
+   });
+-  const onSave = vi.fn();
+ 
+   await act(async () => {
+     root.render(
+@@ -3700,7 +3699,6 @@ describe("AgentConfigForm Role field", () => {
+   let roots: Root[] = [];
+ 
+   beforeEach(() => {
+-    mockAgentsApi.adapterModelProfiles.mockResolvedValue([]);
+     mockAgentsApi.adapterModels.mockResolvedValue([]);
+     mockAgentsApi.detectModel.mockResolvedValue(null);
+     mockAgentsApi.list.mockResolvedValue([]);

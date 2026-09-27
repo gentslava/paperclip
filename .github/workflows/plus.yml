@@ -1,0 +1,142 @@
+name: plus
+
+# Builds ghcr.io/gentslava/paperclip:plus from upstream master + the PRs in
+# .plus/prs.txt + .plus/fixups. Nothing is pushed back to the repo; the image
+# labels record what was built. See .plus/README.md.
+
+on:
+  schedule:
+    - cron: "30 10 * * *" # after the upstream nightly image (~08:45 UTC)
+  workflow_dispatch:
+
+concurrency:
+  group: plus
+  cancel-in-progress: false
+
+jobs:
+  plus:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/paperclip
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout plus config
+        uses: actions/checkout@v4
+        with:
+          path: config
+
+      - name: Clone upstream master
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-tags --branch master \
+            https://github.com/paperclipai/paperclip.git src
+          cd src
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Merge PRs
+        id: merge
+        working-directory: src
+        run: |
+          set -euo pipefail
+          included=()
+          while read -r pr _; do
+            [ -z "$pr" ] && continue
+            state="$(gh api "repos/paperclipai/paperclip/pulls/$pr" --jq 'if .merged then "merged" else .state end')"
+            if [ "$state" != "open" ]; then
+              echo "::notice::#$pr is $state upstream, skipped"
+              continue
+            fi
+            git fetch -q --no-tags origin "pull/$pr/head:pr-$pr"
+            if ! git merge -q --no-ff --no-edit -m "plus: merge upstream PR #$pr" "pr-$pr"; then
+              git diff --name-only --diff-filter=U
+              echo "::error::#$pr does not merge cleanly on upstream master"
+              exit 1
+            fi
+            included+=("$pr")
+          done < <(sed -e 's/#.*//' ../config/.plus/prs.txt)
+          echo "prs=${included[*]}" >> "$GITHUB_OUTPUT"
+          echo "Merged: ${included[*]}"
+
+      - name: Apply fixups
+        working-directory: src
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for patch in ../config/.plus/fixups/*.patch; do
+            if git apply --3way "$patch"; then
+              git add -A && git commit -qm "plus: fixup $(basename "$patch")"
+            else
+              git reset -q --hard && git clean -fdq
+              echo "::warning::$(basename "$patch") no longer applies, skipped"
+            fi
+          done
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+          run_install: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Refresh lockfile
+        working-directory: src
+        run: |
+          set -euo pipefail
+          pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile
+          git status --porcelain
+
+      - name: Build metadata
+        id: meta
+        working-directory: src
+        run: |
+          set -euo pipefail
+          echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "upstream=$(git rev-parse --short origin/master)" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+          echo "epoch=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/share/swift /usr/local/lib/android /usr/local/share/boost \
+            /usr/local/share/powershell /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          docker system prune -af || true
+          df -h /
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: src
+          file: src/Dockerfile
+          target: production
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          build-args: |
+            CLI_TOOLS_CACHE_EPOCH=${{ steps.meta.outputs.epoch }}
+            PAPERCLIP_BUILD_VERSION=plus-${{ steps.meta.outputs.date }}-${{ steps.meta.outputs.upstream }}
+            PAPERCLIP_BUILD_COMMIT=${{ steps.meta.outputs.sha }}
+          tags: |
+            ${{ env.IMAGE }}:plus
+            ${{ env.IMAGE }}:plus-${{ steps.meta.outputs.date }}-${{ steps.meta.outputs.upstream }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.meta.outputs.sha }}
+            dev.gentslava.plus.upstream=${{ steps.meta.outputs.upstream }}
+            dev.gentslava.plus.prs=${{ steps.merge.outputs.prs }}
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-plus
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-plus,mode=max

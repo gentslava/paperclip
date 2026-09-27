@@ -1,0 +1,7 @@
+# Upstream PRs (paperclipai/paperclip) merged on top of master, in this order.
+# One number per line; text after "#" is a comment. Merged/closed PRs are skipped automatically.
+13726  # fix(ai-connections): rotate Claude subscription credentials from a file (Claude login refresh)
+14027  # fix(agents): let bound agents be edited and unbound from AI connections
+10862  # Make agent role editable after creation
+14147  # fix(claude-local): show the ANTHROPIC_MODEL default in the model picker (ours)
+14224  # fix(ai-connections): reactivate an archived provider application on connect (ours)
