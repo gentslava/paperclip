@@ -11,3 +11,11 @@
 13885  # fix(claude-local): stop sealing max-turns failures as model_not_found
 14039  # fix(claude-local): map thinking effort to the selected model
 13566  # fix(server): restore top-level redacted adapter secrets on agent update
+# Picked with PR Scout (Jev) + manual review, 2026-09-27; merge + typecheck verified on top of the list above
+12842  # fix(agents): merge runtimeConfig on PATCH instead of replacing the column
+12870  # fix(adapter-utils): strip DATABASE_URL and BETTER_AUTH_SECRET from inherited agent env
+13833  # fix(server): bind run context to the checked-out issue so taskless runs can write
+13782  # fix: keep the requesting run alive when an agent hands off its own issue
+14012  # fix(heartbeat): bind run-scoped runtime gateways to their agent
+7432   # fix(issues): resolve identifier to UUID for parentId/descendantOf filters
+12117  # fix(skill): teach agents that PAPERCLIP_API_URL excludes the /api prefix
