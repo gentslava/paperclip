@@ -5,3 +5,9 @@
 10862  # Make agent role editable after creation
 14147  # fix(claude-local): show the ANTHROPIC_MODEL default in the model picker (ours)
 14224  # fix(ai-connections): reactivate an archived provider application on connect (ours)
+# Community fixes (reviewed, tests green on top of the list above)
+13647  # fix(claude-local): stop scanning the raw transcript for login prompts
+14089  # fix(claude-local): gate claude_auth_required on a failed run
+13885  # fix(claude-local): stop sealing max-turns failures as model_not_found
+14039  # fix(claude-local): map thinking effort to the selected model
+13566  # fix(server): restore top-level redacted adapter secrets on agent update
