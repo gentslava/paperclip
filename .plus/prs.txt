@@ -5,6 +5,7 @@
 10862  # Make agent role editable after creation
 14147  # fix(claude-local): show the ANTHROPIC_MODEL default in the model picker (ours)
 14224  # fix(ai-connections): reactivate an archived provider application on connect (ours)
+14328  # fix(ui): make destructive-foreground readable in the light theme (ours)
 # Community fixes (reviewed, tests green on top of the list above)
 13647  # fix(claude-local): stop scanning the raw transcript for login prompts
 14089  # fix(claude-local): gate claude_auth_required on a failed run
