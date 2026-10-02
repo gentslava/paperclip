@@ -97,7 +97,7 @@ jobs:
         working-directory: src
         run: |
           set -euo pipefail
-          echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "upstream=$(git rev-parse --short origin/master)" >> "$GITHUB_OUTPUT"
           echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
           echo "epoch=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
