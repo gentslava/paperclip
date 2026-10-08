@@ -34,6 +34,7 @@ import { accountRunCost, createCostAccountingReconciler } from "./run-cost-accou
 import { createRunUsageRecorder } from "./usage-receipts.js";
 import { applyWorkspaceRestoreFailure } from "@paperclipai/adapter-utils/workspace-restore-result";
 import { compareCents, hasWorkspaceRestoreFailure } from "@paperclipai/shared";
+import { mergeRunRuntimeServicesIntoSnapshot } from "./run-context-snapshot.js";
 import { externalConversationStateSql, nonIdleSlackIssueCondition } from "./slack-conversation-state.js";
 import { settleSlackConversation } from "./slack-conversation-lifecycle.js";
 import { publicChatTaskUrl } from "./chat-task-url.js";
@@ -25813,17 +25814,21 @@ export function heartbeatService(
             ...adapterManagedRuntimeServices,
           ];
           context.paperclipRuntimeServices = combinedRuntimeServices;
-          context.paperclipRuntimePrimaryUrl =
+          const runtimePrimaryUrl =
             combinedRuntimeServices.find((service) =>
               readNonEmptyString(service.url),
             )?.url ?? null;
-          await db
-            .update(heartbeatRuns)
-            .set({
-              contextSnapshot: context,
-              updatedAt: new Date(),
-            })
-            .where(eq(heartbeatRuns.id, run.id));
+          context.paperclipRuntimePrimaryUrl = runtimePrimaryUrl;
+          // Merge only the runtime-service fields this writer owns. The
+          // in-memory `context` was read before dispatch, so writing it back
+          // wholesale would erase an issue anchor the checkout route bound
+          // into the persisted snapshot mid-run (and re-open the
+          // taskless-write wall).
+          await mergeRunRuntimeServicesIntoSnapshot(db, {
+            runId: run.id,
+            runtimeServices: combinedRuntimeServices,
+            primaryUrl: runtimePrimaryUrl,
+          });
           if (issueId) {
             try {
               await postWorkspaceReadyComment({
