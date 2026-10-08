@@ -1,4 +1,4 @@
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useRef, type RefObject } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { AdminUserDirectoryEntry, UserCompanyAccessResponse } from "@/api/access";
@@ -83,27 +83,32 @@ function seededClient(users: AdminUserDirectoryEntry[]) {
   return client;
 }
 
-/** Clicks an account action once it renders, so the story opens on its dialog. */
-function useOpenAction(label: string | undefined) {
+/**
+ * Clicks an account action once it renders, so the story opens on its dialog.
+ * The search stays inside this story's container: the Docs view renders every
+ * story on one page, and the others have the same buttons.
+ */
+function useOpenAction(container: RefObject<HTMLDivElement | null>, label: string | undefined) {
   useEffect(() => {
     if (!label) return;
     const tick = window.setInterval(() => {
-      const action = Array.from(document.querySelectorAll<HTMLButtonElement>("button"))
+      const action = Array.from(container.current?.querySelectorAll<HTMLButtonElement>("button") ?? [])
         .find((button) => button.textContent === label);
       if (!action) return;
       window.clearInterval(tick);
       action.click();
     }, 50);
     return () => window.clearInterval(tick);
-  }, [label]);
+  }, [container, label]);
 }
 
 function InstanceAccessHost({ users, openAction }: { users: AdminUserDirectoryEntry[]; openAction?: string }) {
   const client = useMemo(() => seededClient(users), [users]);
-  useOpenAction(openAction);
+  const container = useRef<HTMLDivElement>(null);
+  useOpenAction(container, openAction);
   return (
     <QueryClientProvider client={client}>
-      <div className="mx-auto max-w-5xl p-6">
+      <div ref={container} className="mx-auto max-w-5xl p-6">
         <InstanceAccess />
       </div>
     </QueryClientProvider>
