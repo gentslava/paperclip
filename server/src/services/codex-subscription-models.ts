@@ -9,7 +9,14 @@ import { aiConnectionService } from "./ai-connections.js";
 // shows up in the picker within this window; Refresh skips the wait.
 const CATALOG_TTL_MS = 10 * 60_000;
 const VERSION_TTL_MS = 10 * 60_000;
-const REFRESH_TIMEOUT_MS = 30_000;
+// Refresh starts a new lookup only when the last one has finished and began at
+// least this long ago; a lookup in flight is always shared. Repeated Refresh calls
+// thus cannot stack up Codex processes or catalog requests.
+const REFRESH_INTERVAL_MS = 60_000;
+// One account's lookup, token refresh included, is cancelled after this even
+// when nobody waits for the answer any more.
+const ACCOUNT_LOOKUP_TIMEOUT_MS = 20_000;
+const ACCOUNT_LOOKUP_CONCURRENCY = 4;
 // The longest the model picker waits for the live catalog before it shows the
 // static list. The catalog request itself times out after 5 seconds.
 const LOOKUP_BUDGET_MS = 8_000;
@@ -17,24 +24,39 @@ const LOOKUP_BUDGET_MS = 8_000;
 // dropped on each lookup, and the oldest go first past this bound.
 const MAX_CACHED_CATALOGS = 256;
 
-const catalogs = new Map<string, { expires: number; models: Promise<AdapterModel[]> }>();
-let installedVersion: { expires: number; version: Promise<string | null> } | null = null;
+type CacheEntry<T> = { started: number; expires: number; settled: boolean; value: Promise<T> };
+
+const catalogs = new Map<string, CacheEntry<AdapterModel[]>>();
+let installedVersion: CacheEntry<string | null> | null = null;
+
+function cacheEntry<T>(value: Promise<T>, ttlMs: number): CacheEntry<T> {
+  const now = Date.now();
+  const entry: CacheEntry<T> = { started: now, expires: now + ttlMs, settled: false, value };
+  const settle = () => { entry.settled = true; };
+  void value.then(settle, settle);
+  return entry;
+}
+
+function reusable(entry: CacheEntry<unknown> | null | undefined, refresh: boolean): boolean {
+  if (!entry) return false;
+  if (!entry.settled) return true;
+  const now = Date.now();
+  if (entry.expires <= now) return false;
+  return !refresh || entry.started + REFRESH_INTERVAL_MS > now;
+}
 
 /** The Codex CLI on the Paperclip host, which `codex_local` agents run. */
 function installedCodexVersion(refresh: boolean): Promise<string | null> {
-  if (refresh || !installedVersion || installedVersion.expires <= Date.now()) {
-    installedVersion = {
-      expires: Date.now() + VERSION_TTL_MS,
-      version: readCodexCommandVersion({
-        runId: "codex-model-catalog",
-        command: "codex",
-        target: null,
-        cwd: process.cwd(),
-        env: { PATH: process.env.PATH ?? "" },
-      }),
-    };
+  if (!reusable(installedVersion, refresh)) {
+    installedVersion = cacheEntry(readCodexCommandVersion({
+      runId: "codex-model-catalog",
+      command: "codex",
+      target: null,
+      cwd: process.cwd(),
+      env: { PATH: process.env.PATH ?? "" },
+    }), VERSION_TTL_MS);
   }
-  return installedVersion.version;
+  return installedVersion!.value;
 }
 
 function readSubscriptionToken(value: string): { accessToken: string; accountId: string | null } | null {
@@ -60,10 +82,11 @@ export async function listCodexSubscriptionModels(
   db: Db,
   companyId: string,
   userId: string,
-  options: { refresh?: boolean; budgetMs?: number } = {},
+  options: { refresh?: boolean; budgetMs?: number; accountTimeoutMs?: number } = {},
 ): Promise<AdapterModel[]> {
   // The picker must not wait on the live catalog or fail because of it. A
-  // slow lookup keeps running and fills the cache for the next request.
+  // slow lookup keeps running, within its own deadline, and fills the cache
+  // for the next request.
   let timer: NodeJS.Timeout | undefined;
   const budget = new Promise<AdapterModel[]>((resolve) => {
     timer = setTimeout(() => resolve([]), options.budgetMs ?? LOOKUP_BUDGET_MS);
@@ -84,7 +107,7 @@ async function lookupCodexSubscriptionModels(
   db: Db,
   companyId: string,
   userId: string,
-  options: { refresh?: boolean },
+  options: { refresh?: boolean; accountTimeoutMs?: number },
 ): Promise<AdapterModel[]> {
   pruneCatalogs();
   const service = aiConnectionService(db);
@@ -94,27 +117,26 @@ async function lookupCodexSubscriptionModels(
   const clientVersion = await installedCodexVersion(options.refresh === true);
   if (!clientVersion) return [];
 
-  const perAccount = await Promise.all(accounts.map((row) => {
+  const readAccount = (row: (typeof accounts)[number]): Promise<AdapterModel[]> => {
     const accountKey = createHash("sha256").update(JSON.stringify([
       companyId, row.connection.id, row.grant.id, row.connection.updatedAt, row.grant.updatedAt,
       row.grant.credentialSecretRefs.map((ref) => ref.secretId),
     ])).digest("hex");
     const key = `${userId}:${accountKey}:${clientVersion}`;
     const cached = catalogs.get(key);
-    if (!options.refresh && cached && cached.expires > Date.now()) return cached.models;
-    const models = (async () => {
+    if (reusable(cached, options.refresh === true)) return cached!.value;
+    const signal = AbortSignal.timeout(options.accountTimeoutMs ?? ACCOUNT_LOOKUP_TIMEOUT_MS);
+    const models: Promise<AdapterModel[]> = (async () => {
       const value = await service.credential(row);
       const token = readSubscriptionToken(value);
       if (!token) return [];
       try {
-        return await fetchCodexModelCatalog({ ...token, clientVersion });
+        return await fetchCodexModelCatalog({ ...token, clientVersion, signal });
       } catch (error) {
         if (!(error instanceof Error) || !/\b401\b/.test(error.message)) throw error;
-        const refreshed = readSubscriptionToken(
-          await service.refreshQuotaCredential(row, value, AbortSignal.timeout(REFRESH_TIMEOUT_MS)),
-        );
+        const refreshed = readSubscriptionToken(await service.refreshQuotaCredential(row, value, signal));
         if (!refreshed) return [];
-        return fetchCodexModelCatalog({ ...refreshed, clientVersion });
+        return fetchCodexModelCatalog({ ...refreshed, clientVersion, signal });
       }
     })().catch((error: unknown) => {
       // Provider errors can echo credential material; log the family only.
@@ -122,14 +144,23 @@ async function lookupCodexSubscriptionModels(
         { companyId, connectionId: row.connection.id, status: error instanceof Error ? /\b(\d{3})\b/.exec(error.message)?.[1] : undefined },
         "Codex subscription model catalog unavailable",
       );
-      // Drop only this request's entry; a Refresh may have replaced it already.
-      if (catalogs.get(key)?.models === models) catalogs.delete(key);
+      // Drop only this request's entry; a later lookup may have replaced it.
+      if (catalogs.get(key)?.value === models) catalogs.delete(key);
       return [] as AdapterModel[];
     });
     catalogs.delete(key);
-    catalogs.set(key, { expires: Date.now() + CATALOG_TTL_MS, models });
+    catalogs.set(key, cacheEntry(models, CATALOG_TTL_MS));
     evictOldestCatalogs();
     return models;
+  };
+
+  const perAccount: AdapterModel[][] = new Array(accounts.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(ACCOUNT_LOOKUP_CONCURRENCY, accounts.length) }, async () => {
+    while (next < accounts.length) {
+      const index = next++;
+      perAccount[index] = await readAccount(accounts[index]);
+    }
   }));
 
   const seen = new Set<string>();
@@ -138,7 +169,7 @@ async function lookupCodexSubscriptionModels(
 
 function pruneCatalogs() {
   const now = Date.now();
-  for (const [key, entry] of catalogs) if (entry.expires <= now) catalogs.delete(key);
+  for (const [key, entry] of catalogs) if (entry.settled && entry.expires <= now) catalogs.delete(key);
 }
 
 /** Keep the cache within its bound after every insert, oldest out first. */

@@ -47,7 +47,9 @@ describe("Codex subscription model catalog", () => {
     mocks.accounts.mockResolvedValue([account("chatgpt")]);
     await expect(listCodexSubscriptionModels(db, "company", "user"))
       .resolves.toEqual([{ id: "gpt-6.1-sol", label: "GPT-6.1-Sol" }]);
-    expect(mocks.catalog).toHaveBeenCalledWith({ accessToken: "access", accountId: "account", clientVersion: "0.161.0" });
+    expect(mocks.catalog).toHaveBeenCalledWith({
+      accessToken: "access", accountId: "account", clientVersion: "0.161.0", signal: expect.any(AbortSignal),
+    });
     expect(mocks.version).toHaveBeenCalledWith(expect.objectContaining({ command: "codex", target: null }));
   });
 
@@ -78,12 +80,58 @@ describe("Codex subscription model catalog", () => {
   });
 
   it("caches per account and skips the cache on Refresh", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      mocks.accounts.mockResolvedValue([account("chatgpt")]);
+      await listCodexSubscriptionModels(db, "company", "user");
+      await listCodexSubscriptionModels(db, "company", "user");
+      expect(mocks.catalog).toHaveBeenCalledTimes(1);
+      vi.setSystemTime(Date.now() + 61_000);
+      await listCodexSubscriptionModels(db, "company", "user", { refresh: true });
+      expect(mocks.catalog).toHaveBeenCalledTimes(2);
+      expect(mocks.version).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not start new probes for repeated Refresh calls", async () => {
     mocks.accounts.mockResolvedValue([account("chatgpt")]);
-    await listCodexSubscriptionModels(db, "company", "user");
-    await listCodexSubscriptionModels(db, "company", "user");
-    expect(mocks.catalog).toHaveBeenCalledTimes(1);
     await listCodexSubscriptionModels(db, "company", "user", { refresh: true });
-    expect(mocks.catalog).toHaveBeenCalledTimes(2);
+    await listCodexSubscriptionModels(db, "company", "user", { refresh: true });
+    await Promise.all(Array.from({ length: 5 }, () => listCodexSubscriptionModels(db, "company", "user", { refresh: true })));
+    expect(mocks.version).toHaveBeenCalledTimes(1);
+    expect(mocks.catalog).toHaveBeenCalledTimes(1);
+  });
+
+  it("shares a lookup in flight with concurrent Refresh calls", async () => {
+    mocks.accounts.mockResolvedValue([account("chatgpt")]);
+    let finishVersion!: (version: string) => void;
+    mocks.version.mockReturnValueOnce(new Promise((resolve) => { finishVersion = resolve; }));
+    const first = listCodexSubscriptionModels(db, "company", "user");
+    const refreshes = Array.from({ length: 5 }, () => listCodexSubscriptionModels(db, "company", "user", { refresh: true }));
+    await vi.waitFor(() => expect(mocks.version).toHaveBeenCalledTimes(1));
+    finishVersion("0.161.0");
+    for (const result of await Promise.all([first, ...refreshes])) expect(result).toHaveLength(1);
+    expect(mocks.version).toHaveBeenCalledTimes(1);
+    expect(mocks.catalog).toHaveBeenCalledTimes(1);
+  });
+
+  it("reads at most four accounts at a time", async () => {
+    mocks.accounts.mockResolvedValue(Array.from({ length: 10 }, (_, index) => account(`account-${index}`)));
+    mocks.catalog.mockReturnValue(new Promise(() => {}));
+    await expect(listCodexSubscriptionModels(db, "company", "user", { budgetMs: 50 })).resolves.toEqual([]);
+    expect(mocks.catalog).toHaveBeenCalledTimes(4);
+  });
+
+  it("cancels an account lookup after its own deadline, even past the picker's budget", async () => {
+    mocks.accounts.mockResolvedValue([account("chatgpt")]);
+    mocks.catalog.mockReturnValue(new Promise(() => {}));
+    await expect(listCodexSubscriptionModels(db, "company", "user", { budgetMs: 20, accountTimeoutMs: 200 }))
+      .resolves.toEqual([]);
+    const { signal } = mocks.catalog.mock.calls[0][0] as { signal: AbortSignal };
+    expect(signal.aborted).toBe(false);
+    await vi.waitFor(() => expect(signal.aborted).toBe(true));
   });
 
   it("merges several subscriptions without duplicates", async () => {
@@ -108,16 +156,16 @@ describe("Codex subscription model catalog", () => {
     await expect(listCodexSubscriptionModels(db, "company", "user", { budgetMs: 20 })).resolves.toEqual([]);
   });
 
-  it("keeps a refreshed catalog when an older request fails afterwards", async () => {
+  it("retries a failed lookup that a Refresh shared", async () => {
     mocks.accounts.mockResolvedValue([account("chatgpt")]);
     let failSlowRequest!: (error: Error) => void;
     mocks.catalog.mockReturnValueOnce(new Promise((_resolve, reject) => { failSlowRequest = reject; }));
     const slow = listCodexSubscriptionModels(db, "company", "user");
     await vi.waitFor(() => expect(mocks.catalog).toHaveBeenCalledTimes(1));
-    await expect(listCodexSubscriptionModels(db, "company", "user", { refresh: true })).resolves.toHaveLength(1);
+    const refresh = listCodexSubscriptionModels(db, "company", "user", { refresh: true });
     failSlowRequest(new Error("chatgpt codex models api returned 503"));
-    await expect(slow).resolves.toEqual([]);
-    await listCodexSubscriptionModels(db, "company", "user");
+    await expect(Promise.all([slow, refresh])).resolves.toEqual([[], []]);
+    await expect(listCodexSubscriptionModels(db, "company", "user")).resolves.toHaveLength(1);
     expect(mocks.catalog).toHaveBeenCalledTimes(2);
   });
 
