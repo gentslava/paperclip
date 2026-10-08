@@ -12,7 +12,6 @@ import {
 } from "@paperclipai/db";
 import type { Config } from "../config.js";
 import { resolvePaperclipInstanceId } from "../home-paths.js";
-import { userDisablementPlugin } from "./user-disablement-plugin.js";
 import {
   workspaceLoginHandoffPlugin,
   type WorkspaceHandoffExpectedIdentity,
@@ -23,6 +22,7 @@ import {
   resolveWorkspaceHandoffLocalKey,
   resolveWorkspaceHandoffLocalWorkspaceId,
 } from "./workspace-login-handoff.js";
+import { userDisablementPlugin } from "./user-disablement-plugin.js";
 
 export type BetterAuthSessionUser = {
   id: string;
