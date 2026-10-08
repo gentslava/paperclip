@@ -7,6 +7,7 @@
 14224  # fix(ai-connections): reactivate an archived provider application on connect (ours)
 14257  # fix(heartbeat): keep wakeup reads on their transaction connection (pool deadlock, #14196/#14197)
 15534  # feat(codex-local): list the ChatGPT subscription's Codex catalog in the model picker (ours)
+15539  # feat(auth): add invite-only sign-up mode (ours)
 # Community fixes (reviewed, tests green on top of the list above)
 13647  # fix(claude-local): stop scanning the raw transcript for login prompts
 14089  # fix(claude-local): gate claude_auth_required on a failed run
