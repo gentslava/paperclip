@@ -228,6 +228,47 @@ describe("AuthPage", () => {
     });
   });
 
+  it("tells visitors that registration is by invitation only instead of offering a sign-up form", async () => {
+    healthMock.mockResolvedValue({ status: "ok", deploymentMode: "authenticated", authSignUpMode: "invite" });
+    const { root } = await mount();
+
+    expect(container.querySelector('input[name="email"]')).not.toBeNull();
+    expect(Array.from(container.querySelectorAll("button")).some((b) => b.textContent === "Create one")).toBe(false);
+    expect(container.querySelector('[data-testid="auth-sign-up-unavailable"]')?.textContent).toContain(
+      "Registration on this instance is by invitation only.",
+    );
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("does not offer sign-up when registration is disabled", async () => {
+    healthMock.mockResolvedValue({ status: "ok", deploymentMode: "authenticated", authSignUpMode: "disabled" });
+    const { root } = await mount();
+
+    expect(Array.from(container.querySelectorAll("button")).some((b) => b.textContent === "Create one")).toBe(false);
+    expect(container.querySelector('[data-testid="auth-sign-up-unavailable"]')?.textContent).toContain(
+      "Registration of new accounts is closed on this instance.",
+    );
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("keeps the sign-up option in open mode", async () => {
+    healthMock.mockResolvedValue({ status: "ok", deploymentMode: "authenticated", authSignUpMode: "open" });
+    const { root } = await mount();
+
+    expect(Array.from(container.querySelectorAll("button")).some((b) => b.textContent === "Create one")).toBe(true);
+    expect(container.querySelector('[data-testid="auth-sign-up-unavailable"]')).toBeNull();
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
   it("renders auth errors in an assertive alert region referenced by the inputs", async () => {
     const { root } = await mount();
 
