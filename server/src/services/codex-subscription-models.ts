@@ -10,6 +10,12 @@ import { aiConnectionService } from "./ai-connections.js";
 const CATALOG_TTL_MS = 10 * 60_000;
 const VERSION_TTL_MS = 10 * 60_000;
 const REFRESH_TIMEOUT_MS = 30_000;
+// The longest the model picker waits for the live catalog before it shows the
+// static list. The catalog request itself times out after 5 seconds.
+const LOOKUP_BUDGET_MS = 8_000;
+// Accounts and CLI versions change over a server's life. Expired entries are
+// dropped on each lookup, and the oldest go first past this bound.
+const MAX_CACHED_CATALOGS = 256;
 
 const catalogs = new Map<string, { expires: number; models: Promise<AdapterModel[]> }>();
 let installedVersion: { expires: number; version: Promise<string | null> } | null = null;
@@ -54,8 +60,33 @@ export async function listCodexSubscriptionModels(
   db: Db,
   companyId: string,
   userId: string,
-  options: { refresh?: boolean } = {},
+  options: { refresh?: boolean; budgetMs?: number } = {},
 ): Promise<AdapterModel[]> {
+  // The picker must not wait on the live catalog or fail because of it. A
+  // slow lookup keeps running and fills the cache for the next request.
+  let timer: NodeJS.Timeout | undefined;
+  const budget = new Promise<AdapterModel[]>((resolve) => {
+    timer = setTimeout(() => resolve([]), options.budgetMs ?? LOOKUP_BUDGET_MS);
+    timer.unref?.();
+  });
+  const lookup = lookupCodexSubscriptionModels(db, companyId, userId, options).catch((error: unknown) => {
+    logger.warn({ companyId, err: error instanceof Error ? error.name : typeof error }, "Codex subscription model lookup failed");
+    return [] as AdapterModel[];
+  });
+  try {
+    return await Promise.race([lookup, budget]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function lookupCodexSubscriptionModels(
+  db: Db,
+  companyId: string,
+  userId: string,
+  options: { refresh?: boolean },
+): Promise<AdapterModel[]> {
+  pruneCatalogs();
   const service = aiConnectionService(db);
   const accounts = (await service.quotaAccounts(companyId, userId))
     .filter((row) => row.summary.provider === "openai" && row.summary.status === "connected");
@@ -94,12 +125,27 @@ export async function listCodexSubscriptionModels(
       catalogs.delete(key);
       return [] as AdapterModel[];
     });
+    catalogs.delete(key);
     catalogs.set(key, { expires: Date.now() + CATALOG_TTL_MS, models });
     return models;
   }));
 
   const seen = new Set<string>();
   return perAccount.flat().filter((model) => (seen.has(model.id) ? false : (seen.add(model.id), true)));
+}
+
+function pruneCatalogs() {
+  const now = Date.now();
+  for (const [key, entry] of catalogs) if (entry.expires <= now) catalogs.delete(key);
+  // Map keeps insertion order, so the first keys are the oldest entries.
+  for (const key of catalogs.keys()) {
+    if (catalogs.size < MAX_CACHED_CATALOGS) break;
+    catalogs.delete(key);
+  }
+}
+
+export function codexSubscriptionModelsCacheSizeForTests() {
+  return catalogs.size;
 }
 
 export function resetCodexSubscriptionModelsCacheForTests() {

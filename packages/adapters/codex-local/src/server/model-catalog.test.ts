@@ -71,4 +71,30 @@ describe("fetchCodexModelCatalog", () => {
       .rejects.toThrow("stable Codex CLI version");
     expect(fetch).not.toHaveBeenCalled();
   });
+
+  it("keeps the deadline through a body that stalls after the headers", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init: RequestInit) => new Response(new ReadableStream({
+      // Like a real fetch body, the stream fails when the request signal aborts.
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"models": ['));
+        init.signal!.addEventListener("abort", () => controller.error(init.signal!.reason));
+      },
+    }))));
+    await expect(fetchCodexModelCatalog({ accessToken: "access", accountId: null, clientVersion: "0.161.0", timeoutMs: 50 }))
+      .rejects.toThrow();
+  });
+
+  it("stops reading a body that grows past the size limit", async () => {
+    const chunk = new Uint8Array(1024 * 1024).fill(0x20);
+    let sent = 0;
+    const cancel = vi.fn();
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(new ReadableStream({
+      pull(controller) { sent += 1; controller.enqueue(chunk); },
+      cancel,
+    }))));
+    await expect(fetchCodexModelCatalog({ accessToken: "access", accountId: null, clientVersion: "0.161.0" }))
+      .rejects.toThrow("too large");
+    expect(cancel).toHaveBeenCalled();
+    expect(sent).toBeLessThanOrEqual(6);
+  });
 });

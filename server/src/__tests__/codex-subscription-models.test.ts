@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Db } from "@paperclipai/db";
 
 const mocks = vi.hoisted(() => ({
@@ -20,6 +20,7 @@ vi.mock("@paperclipai/adapter-codex-local/server", () => ({
   readCodexCommandVersion: mocks.version,
 }));
 import {
+  codexSubscriptionModelsCacheSizeForTests,
   listCodexSubscriptionModels,
   resetCodexSubscriptionModelsCacheForTests,
 } from "../services/codex-subscription-models.js";
@@ -94,5 +95,39 @@ describe("Codex subscription model catalog", () => {
       { id: "gpt-6-sol", label: "GPT-6-Sol" },
       { id: "gpt-6-astra", label: "GPT-6-Astra" },
     ]);
+  });
+
+  it("never fails the model picker", async () => {
+    mocks.accounts.mockRejectedValue(new Error("database unavailable"));
+    await expect(listCodexSubscriptionModels(db, "company", "user")).resolves.toEqual([]);
+  });
+
+  it("returns the static list when the lookup outlasts its budget", async () => {
+    mocks.accounts.mockResolvedValue([account("chatgpt")]);
+    mocks.version.mockReturnValue(new Promise(() => {}));
+    await expect(listCodexSubscriptionModels(db, "company", "user", { budgetMs: 20 })).resolves.toEqual([]);
+  });
+
+  describe("cache bounds", () => {
+    afterEach(() => { vi.useRealTimers(); });
+
+    it("drops expired catalogs of accounts that are gone", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      mocks.accounts.mockResolvedValue([account("old")]);
+      await listCodexSubscriptionModels(db, "company", "user");
+      expect(codexSubscriptionModelsCacheSizeForTests()).toBe(1);
+      vi.setSystemTime(Date.now() + 11 * 60_000);
+      mocks.accounts.mockResolvedValue([account("reconnected")]);
+      await listCodexSubscriptionModels(db, "company", "user");
+      expect(codexSubscriptionModelsCacheSizeForTests()).toBe(1);
+    });
+
+    it("keeps at most 256 catalogs, oldest out first", async () => {
+      mocks.accounts.mockResolvedValue(Array.from({ length: 300 }, (_, index) => account(`account-${index}`)));
+      await listCodexSubscriptionModels(db, "company", "user");
+      mocks.accounts.mockResolvedValue([account("newest")]);
+      await listCodexSubscriptionModels(db, "company", "user");
+      expect(codexSubscriptionModelsCacheSizeForTests()).toBeLessThanOrEqual(256);
+    });
   });
 });

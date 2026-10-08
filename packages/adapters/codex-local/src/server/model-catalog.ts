@@ -1,5 +1,4 @@
 import type { AdapterModel } from "@paperclipai/adapter-utils";
-import { fetchWithTimeout } from "./quota.js";
 
 /**
  * The model catalog the Codex CLI itself shows for a ChatGPT sign-in.
@@ -42,6 +41,7 @@ export async function fetchCodexModelCatalog(input: {
   accountId: string | null;
   clientVersion: string;
   signal?: AbortSignal;
+  timeoutMs?: number;
 }): Promise<AdapterModel[]> {
   if (!STABLE_VERSION.test(input.clientVersion)) {
     throw new Error("Codex model catalog requires a stable Codex CLI version");
@@ -53,23 +53,45 @@ export async function fetchCodexModelCatalog(input: {
   };
   if (input.accountId) headers["ChatGPT-Account-Id"] = input.accountId;
   const url = `${CODEX_MODEL_CATALOG_URL}?client_version=${encodeURIComponent(input.clientVersion)}`;
-  const response = await fetchWithTimeout(
-    url,
-    { headers, redirect: "error", signal: input.signal },
-    CATALOG_TIMEOUT_MS,
-  );
+  // One deadline covers the headers and the body, so a stalled body cannot
+  // hold the model picker past the timeout.
+  const deadline = AbortSignal.timeout(input.timeoutMs ?? CATALOG_TIMEOUT_MS);
+  const signal = input.signal ? AbortSignal.any([input.signal, deadline]) : deadline;
+  const response = await fetch(url, { headers, redirect: "error", signal });
   if (!response.ok) {
     await response.body?.cancel().catch(() => undefined);
     throw new Error(`chatgpt codex models api returned ${response.status}`);
   }
+  return parseCodexModelCatalog(JSON.parse(await readBoundedText(response, MAX_CATALOG_BYTES)));
+}
+
+/** Read at most `maxBytes` of the body; cancel and fail once it is exceeded. */
+async function readBoundedText(response: Response, maxBytes: number): Promise<string> {
   const declaredLength = Number(response.headers.get("content-length"));
-  if (Number.isFinite(declaredLength) && declaredLength > MAX_CATALOG_BYTES) {
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
     await response.body?.cancel().catch(() => undefined);
     throw new Error("chatgpt codex models api answer is too large");
   }
-  const text = await response.text();
-  if (text.length > MAX_CATALOG_BYTES) throw new Error("chatgpt codex models api answer is too large");
-  return parseCodexModelCatalog(JSON.parse(text));
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let received = 0;
+  let text = "";
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      received += value.byteLength;
+      if (received > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw new Error("chatgpt codex models api answer is too large");
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return text + decoder.decode();
 }
 
 /** Keep listed models with a plain slug, ordered by `priority`, then slug. */
