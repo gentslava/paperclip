@@ -141,6 +141,18 @@ describe("connected account quotas", () => {
     expect(failed.errorFamily).toBe("provider_unavailable");
     expect(JSON.stringify(failed)).not.toContain("private credential");
   });
+  it("reads Claude quota with the access token of a stored credential document", async () => {
+    // A refreshable Claude sign-in is stored as the whole credential document.
+    // The usage API takes the bearer token, never the JSON document.
+    mocks.accounts.mockResolvedValue([account("claude-document", "anthropic")]);
+    mocks.credential.mockResolvedValue(JSON.stringify({
+      claudeAiOauth: { accessToken: "claude-document-token", refreshToken: "claude-refresh", expiresAt: 1790000000000 },
+    }));
+    mocks.claude.mockResolvedValue([]);
+    const [result] = await fetchCompanyQuotaWindows(db, "company-claude-document", "user");
+    expect(result.ok).toBe(true);
+    expect(mocks.claude).toHaveBeenCalledWith("claude-document-token", expect.any(AbortSignal));
+  });
   it("reads quota for a verified login without an optional account ID", async () => {
     mocks.accounts.mockResolvedValue([account("missing-identity")]);
     mocks.credential.mockResolvedValue(

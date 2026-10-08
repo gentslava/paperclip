@@ -7,6 +7,7 @@ import { eq, inArray, and } from "drizzle-orm";
 import { companySecrets, companySecretVersions, userSecretDefinitions, type Db } from "@paperclipai/db";
 import { fetchCodexQuota } from "@paperclipai/adapter-codex-local/server";
 import { fetchClaudeQuota } from "@paperclipai/adapter-claude-local/server";
+import { claudeAccessToken } from "./claude-credential-document.js";
 import { aiConnectionService } from "./ai-connections.js";
 
 const accountRequests = new Map<string, { expires: number; result: Promise<ProviderQuotaResult> }>();
@@ -91,7 +92,7 @@ export async function fetchCompanyQuotaWindows(db: Db, companyId: string, userId
               windows = await read(auth);
             }
           } else {
-            windows = await fetchClaudeQuota(value, controller.signal);
+            windows = await fetchClaudeQuota(claudeAccessToken(value), controller.signal);
           }
           return { ...base, ok: true, windows, capturedAt: new Date().toISOString() };
         } catch (error) {
