@@ -15,6 +15,7 @@ import { Link } from "@/lib/router";
 import {
   deriveOriginatingActor,
   isArtifactReviewDocumentKey,
+  type EnvBinding,
   type ExecutionWorkspace,
   type Issue,
   type IssueLabel,
@@ -743,6 +744,7 @@ export function IssueProperties({
   const assigneePrimaryModel =
     typeof assigneePrimaryAdapterConfig.model === "string" ? assigneePrimaryAdapterConfig.model : "";
   const effectiveAssigneeModel = assigneeOverrideModel || assigneePrimaryModel;
+  const assigneePrimaryEnv = asRecord(assigneePrimaryAdapterConfig.env) as Record<string, EnvBinding>;
   const assigneeOverrideThinkingEffort = thinkingEffortValueFor(
     assigneeAdapterType,
     assigneeOverrideAdapterConfig,
@@ -810,11 +812,12 @@ export function IssueProperties({
       model: nextModel || undefined,
     };
     if (
-      assigneeAdapterType === "codex_local"
-      && assigneeOverrideThinkingEffort
-      && !thinkingEffortOptionsFor(assigneeAdapterType, nextModel || assigneePrimaryModel).some(
-        (option) => option.value === assigneeOverrideThinkingEffort,
-      )
+      assigneeOverrideThinkingEffort
+      && !thinkingEffortOptionsFor(
+        assigneeAdapterType,
+        nextModel || assigneePrimaryModel,
+        assigneePrimaryEnv,
+      ).some((option) => option.value === assigneeOverrideThinkingEffort)
     ) {
       delete nextConfig.modelReasoningEffort;
       delete nextConfig.reasoningEffort;
@@ -893,7 +896,7 @@ export function IssueProperties({
           <div className="space-y-1.5">
             <div className="text-xs text-muted-foreground">Thinking effort</div>
             <div className="flex items-center gap-1.5 flex-wrap">
-              {thinkingEffortOptionsFor(assigneeAdapterType, effectiveAssigneeModel).map((option) => (
+              {thinkingEffortOptionsFor(assigneeAdapterType, effectiveAssigneeModel, assigneePrimaryEnv).map((option) => (
                 <button
                   key={option.value || "default"}
                   className={cn(
