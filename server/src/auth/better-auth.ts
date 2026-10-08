@@ -12,6 +12,7 @@ import {
 } from "@paperclipai/db";
 import type { Config } from "../config.js";
 import { resolvePaperclipInstanceId } from "../home-paths.js";
+import { userDisablementPlugin } from "./user-disablement-plugin.js";
 import {
   workspaceLoginHandoffPlugin,
   type WorkspaceHandoffExpectedIdentity,
@@ -281,12 +282,14 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
       override: process.env.PAPERCLIP_AUTH_RATE_LIMIT_ENABLED,
     }),
     advanced: buildBetterAuthAdvancedOptions({ disableSecureCookies }),
-    // Registered only for a managed workspace instance: the plugin is what makes
-    // `Open workspace` password-independent, and a control-plane instance that
-    // was never handed a workspace key must not expose the exchange at all.
-    ...(resolveWorkspaceHandoffIdentity(config)
-      ? {
-          plugins: [
+    plugins: [
+      // Blocks session creation for accounts an instance admin disabled.
+      userDisablementPlugin({ db }),
+      // Registered only for a managed workspace instance: the plugin is what makes
+      // `Open workspace` password-independent, and a control-plane instance that
+      // was never handed a workspace key must not expose the exchange at all.
+      ...(resolveWorkspaceHandoffIdentity(config)
+        ? [
             workspaceLoginHandoffPlugin({
               db,
               // Re-resolved per exchange so a hot restart cannot keep validating
@@ -300,9 +303,9 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
                   origin: null,
                 },
             }),
-          ],
-        }
-      : {}),
+          ]
+        : []),
+    ],
   };
 
   if (!baseUrl) {

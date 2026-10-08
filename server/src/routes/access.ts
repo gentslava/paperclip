@@ -39,6 +39,7 @@ import {
   listJoinRequestsQuerySchema,
   resolveCliAuthChallengeSchema,
   searchAdminUsersQuerySchema,
+  disableInstanceUserSchema,
   updateCompanyMemberWithPermissionsSchema,
   updateCompanyMemberSchema,
   archiveCompanyMemberSchema,
@@ -104,6 +105,7 @@ import {
   inspectBoardClaimChallenge
 } from "../board-claim.js";
 import { claimFirstInstanceAdmin } from "../first-admin-claim.js";
+import { instanceUserService, listActiveUserDisablements } from "../services/instance-users.js";
 import { getStorageService } from "../storage/index.js";
 import { secretService } from "../services/secrets.js";
 
@@ -2639,6 +2641,9 @@ export function accessRoutes(
   const router = Router();
   const access = accessService(db);
   const boardAuth = boardAuthService(db);
+  const instanceUsers = instanceUserService(db, {
+    implicitLocalAdmin: opts.deploymentMode === "local_trusted",
+  });
   const agents = agentService(db);
   const routeInviteResolutionNetwork = opts.inviteResolutionNetwork
     ? { ...defaultInviteResolutionNetwork, ...opts.inviteResolutionNetwork }
@@ -4717,14 +4722,22 @@ export function accessRoutes(
         ),
       ).then((values) => values.filter((value): value is string => Boolean(value))),
     );
+    const disablements = await listActiveUserDisablements(db, userIds);
 
     res.json(
-      filteredUsers.slice(0, 50).map((user) => ({
-        ...toUserProfile(user),
-        isInstanceAdmin: adminIds.has(user.id),
-        activeCompanyMembershipCount:
-          membershipCountByUserId.get(user.id) ?? 0,
-      })),
+      filteredUsers.slice(0, 50).map((user) => {
+        const disablement = disablements.get(user.id) ?? null;
+        return {
+          ...toUserProfile(user),
+          isInstanceAdmin: adminIds.has(user.id),
+          activeCompanyMembershipCount:
+            membershipCountByUserId.get(user.id) ?? 0,
+          status: disablement ? "disabled" : "active",
+          disabledAt: disablement?.disabledAt ?? null,
+          disabledByUserId: disablement?.disabledByUserId ?? null,
+          disabledReason: disablement?.reason ?? null,
+        };
+      }),
     );
   });
 
@@ -4734,11 +4747,73 @@ export function accessRoutes(
       await assertInstanceAdmin(req);
       assertAccessAdminVisible();
       const userId = req.params.userId as string;
-      const removed = await access.demoteInstanceAdmin(userId);
+      const removed = await instanceUsers.demoteInstanceAdmin({ userId });
       if (!removed) throw notFound("Instance admin role not found");
       res.json(removed);
     }
   );
+
+  router.post(
+    "/admin/users/:userId/disable",
+    validate(disableInstanceUserSchema),
+    async (req, res) => {
+      await assertInstanceAdmin(req);
+      assertAccessAdminVisible();
+      const userId = req.params.userId as string;
+      const actorUserId = req.actor.userId ?? null;
+      const result = await instanceUsers.disableUser({
+        userId,
+        actorUserId,
+        reason: req.body.reason ?? null,
+      });
+      logger.info(
+        { targetUserId: userId, actorUserId, revokedSessionCount: result.revokedSessionCount },
+        "instance admin disabled user",
+      );
+      res.json(result);
+    }
+  );
+
+  router.post(
+    "/admin/users/:userId/enable",
+    async (req, res) => {
+      await assertInstanceAdmin(req);
+      assertAccessAdminVisible();
+      const userId = req.params.userId as string;
+      const actorUserId = req.actor.userId ?? null;
+      const result = await instanceUsers.enableUser({ userId, actorUserId });
+      logger.info({ targetUserId: userId, actorUserId }, "instance admin enabled user");
+      res.json(result);
+    }
+  );
+
+  router.delete("/admin/users/:userId", async (req, res) => {
+    await assertInstanceAdmin(req);
+    assertAccessAdminVisible();
+    const userId = req.params.userId as string;
+    const actorUserId = req.actor.userId ?? null;
+    const result = await instanceUsers.deleteUser({ userId, actorUserId });
+    for (const joinRequest of result.rejectedJoinRequests) {
+      await logActivity(db, {
+        companyId: joinRequest.companyId,
+        actorType: "user",
+        actorId: actorUserId ?? "board",
+        action: "join.rejected",
+        entityType: "join_request",
+        entityId: joinRequest.id,
+        details: { requestType: joinRequest.requestType, reason: "user_deleted" },
+      });
+    }
+    logger.info(
+      { targetUserId: userId, actorUserId, rejectedJoinRequestCount: result.rejectedJoinRequests.length },
+      "instance admin deleted user",
+    );
+    res.json({
+      userId: result.userId,
+      deleted: result.deleted,
+      rejectedJoinRequestCount: result.rejectedJoinRequests.length,
+    });
+  });
 
   router.get("/admin/users/:userId/company-access", async (req, res) => {
     await assertInstanceAdmin(req);
