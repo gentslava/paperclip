@@ -128,6 +128,7 @@ async function lookupCodexSubscriptionModels(
     });
     catalogs.delete(key);
     catalogs.set(key, { expires: Date.now() + CATALOG_TTL_MS, models });
+    evictOldestCatalogs();
     return models;
   }));
 
@@ -138,9 +139,14 @@ async function lookupCodexSubscriptionModels(
 function pruneCatalogs() {
   const now = Date.now();
   for (const [key, entry] of catalogs) if (entry.expires <= now) catalogs.delete(key);
-  // Map keeps insertion order, so the first keys are the oldest entries.
+}
+
+/** Keep the cache within its bound after every insert, oldest out first. */
+function evictOldestCatalogs() {
+  // Map keeps insertion order, and a stored key is re-inserted, so the first
+  // keys are the least recently stored entries.
   for (const key of catalogs.keys()) {
-    if (catalogs.size < MAX_CACHED_CATALOGS) break;
+    if (catalogs.size <= MAX_CACHED_CATALOGS) break;
     catalogs.delete(key);
   }
 }

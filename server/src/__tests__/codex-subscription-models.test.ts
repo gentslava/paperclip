@@ -135,12 +135,15 @@ describe("Codex subscription model catalog", () => {
       expect(codexSubscriptionModelsCacheSizeForTests()).toBe(1);
     });
 
-    it("keeps at most 256 catalogs, oldest out first", async () => {
+    it("never holds more than 256 catalogs, even within one lookup", async () => {
       mocks.accounts.mockResolvedValue(Array.from({ length: 300 }, (_, index) => account(`account-${index}`)));
       await listCodexSubscriptionModels(db, "company", "user");
-      mocks.accounts.mockResolvedValue([account("newest")]);
+      expect(codexSubscriptionModelsCacheSizeForTests()).toBe(256);
+      // The oldest entries went out first: the newest account is still cached.
+      mocks.accounts.mockResolvedValue([account("account-299")]);
+      mocks.catalog.mockClear();
       await listCodexSubscriptionModels(db, "company", "user");
-      expect(codexSubscriptionModelsCacheSizeForTests()).toBeLessThanOrEqual(256);
+      expect(mocks.catalog).not.toHaveBeenCalled();
     });
   });
 });
