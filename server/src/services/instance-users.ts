@@ -47,6 +47,23 @@ export async function isUserDisabled(db: DbOrTx, userId: string): Promise<boolea
   return Boolean(row);
 }
 
+/**
+ * Locks the account row until the transaction ends and returns it, or null
+ * when the user no longer exists. Disable, enable and delete take `update`, so
+ * they run one at a time per account. Approving a join request takes
+ * `key share`: it waits for a delete in flight and then sees the account is
+ * gone, and a delete that starts later sees the new membership. Take this lock
+ * before locking any of the user's join requests, as `deleteUser` does.
+ */
+export async function lockUserAccount(tx: DbOrTx, userId: string, strength: "update" | "key share") {
+  return tx
+    .select({ id: authUsers.id, email: authUsers.email, name: authUsers.name })
+    .from(authUsers)
+    .where(eq(authUsers.id, userId))
+    .for(strength)
+    .then((rows) => rows[0] ?? null);
+}
+
 export async function listActiveUserDisablements(
   db: DbOrTx,
   userIds: string[],
@@ -75,11 +92,7 @@ export type InstanceUserServiceOptions = {
 
 export function instanceUserService(db: Db, opts: InstanceUserServiceOptions = {}) {
   async function requireUser(tx: DbOrTx, userId: string) {
-    const user = await tx
-      .select({ id: authUsers.id, email: authUsers.email, name: authUsers.name })
-      .from(authUsers)
-      .where(eq(authUsers.id, userId))
-      .then((rows) => rows[0] ?? null);
+    const user = await lockUserAccount(tx, userId, "update");
     if (!user) throw notFound("User not found");
     return user;
   }
@@ -161,6 +174,8 @@ export function instanceUserService(db: Db, opts: InstanceUserServiceOptions = {
         .insert(userDisablements)
         .values({ userId: input.userId, reason, disabledByUserId: input.actorUserId })
         .onConflictDoNothing();
+      // The account lock keeps a concurrent enable from closing the block
+      // between the insert and this read.
       const [disablement] = await tx
         .select()
         .from(userDisablements)

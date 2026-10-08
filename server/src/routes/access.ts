@@ -105,7 +105,7 @@ import {
   inspectBoardClaimChallenge
 } from "../board-claim.js";
 import { claimFirstInstanceAdmin } from "../first-admin-claim.js";
-import { instanceUserService, listActiveUserDisablements } from "../services/instance-users.js";
+import { instanceUserService, listActiveUserDisablements, lockUserAccount } from "../services/instance-users.js";
 import { getStorageService } from "../storage/index.js";
 import { secretService } from "../services/secrets.js";
 
@@ -4230,30 +4230,64 @@ export function accessRoutes(
       if (!invite) throw notFound("Invite not found");
 
       let createdAgentId: string | null = existing.createdAgentId ?? null;
+      const markApproved = (executor: Db) =>
+        executor
+          .update(joinRequests)
+          .set({
+            status: "approved",
+            approvedByUserId:
+              req.actor.userId ?? (isLocalImplicit(req) ? "local-board" : null),
+            approvedAt: new Date(),
+            createdAgentId,
+            updatedAt: new Date()
+          })
+          .where(eq(joinRequests.id, requestId))
+          .returning()
+          .then((rows) => rows[0]!);
+      let approved: Awaited<ReturnType<typeof markApproved>>;
       if (existing.requestType === "human") {
-        if (!existing.requestingUserId)
+        const requestingUserId = existing.requestingUserId;
+        if (!requestingUserId)
           throw conflict("Join request missing user identity");
         const membershipRole = resolveHumanInviteRole(
           invite.defaultsPayload as Record<string, unknown> | null,
-        );
-        await access.ensureMembership(
-          companyId,
-          "user",
-          existing.requestingUserId,
-          membershipRole,
-          "active"
         );
         const grants = humanJoinGrantsFromDefaults(
           invite.defaultsPayload as Record<string, unknown> | null,
           membershipRole
         );
-        await access.setPrincipalGrants(
-          companyId,
-          "user",
-          existing.requestingUserId,
-          grants,
-          req.actor.userId ?? null
-        );
+        approved = await db.transaction(async (tx) => {
+          // An instance admin can delete the account at the same time. The
+          // account lock orders the two, so the membership is never created
+          // for a deleted user; see `lockUserAccount`.
+          if (!(await lockUserAccount(tx, requestingUserId, "key share")))
+            throw conflict("Join request user no longer exists");
+          const current = await tx
+            .select({ status: joinRequests.status })
+            .from(joinRequests)
+            .where(eq(joinRequests.id, requestId))
+            .for("update")
+            .then((rows) => rows[0] ?? null);
+          if (current?.status !== "pending_approval")
+            throw conflict("Join request is not pending");
+
+          const txAccess = accessService(tx as unknown as Db);
+          await txAccess.ensureMembership(
+            companyId,
+            "user",
+            requestingUserId,
+            membershipRole,
+            "active"
+          );
+          await txAccess.setPrincipalGrants(
+            companyId,
+            "user",
+            requestingUserId,
+            grants,
+            req.actor.userId ?? null
+          );
+          return markApproved(tx as unknown as Db);
+        });
       } else {
         assertLegacyAgentInviteAdapterType(existing.adapterType);
         const existingAgents = await agents.list(companyId);
@@ -4312,21 +4346,8 @@ export function accessRoutes(
           grants,
           req.actor.userId ?? null
         );
+        approved = await markApproved(db);
       }
-
-      const approved = await db
-        .update(joinRequests)
-        .set({
-          status: "approved",
-          approvedByUserId:
-            req.actor.userId ?? (isLocalImplicit(req) ? "local-board" : null),
-          approvedAt: new Date(),
-          createdAgentId,
-          updatedAt: new Date()
-        })
-        .where(eq(joinRequests.id, requestId))
-        .returning()
-        .then((rows) => rows[0]);
 
       await logActivity(db, {
         companyId,

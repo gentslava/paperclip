@@ -92,6 +92,8 @@ export function InstanceAccess() {
     },
   });
 
+  const errorMessage = (error: unknown) => (error instanceof Error ? error.message : undefined);
+
   const setAdminMutation = useMutation({
     mutationFn: async (makeAdmin: boolean) => {
       if (!selectedUserId) throw new Error("No user selected");
@@ -105,9 +107,10 @@ export function InstanceAccess() {
       }
       pushToast({ title: "Instance role updated", tone: "success" });
     },
+    onError: (error) => {
+      pushToast({ title: "Could not update instance role", body: errorMessage(error), tone: "error" });
+    },
   });
-
-  const errorMessage = (error: unknown) => (error instanceof Error ? error.message : undefined);
 
   const disableUserMutation = useMutation({
     mutationFn: () => accessApi.disableUser(selectedUserId!, disableReason.trim() || null),

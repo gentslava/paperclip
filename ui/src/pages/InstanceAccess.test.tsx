@@ -12,7 +12,7 @@ const mocks = vi.hoisted(() => ({
   list: vi.fn(), directory: vi.fn(), detachInflightList: vi.fn(), detachInflightDirectory: vi.fn(),
   getSession: vi.fn(), searchAdminUsers: vi.fn(), getUserCompanyAccess: vi.fn(),
   setUserCompanyAccess: vi.fn(), setBreadcrumbs: vi.fn(), pushToast: vi.fn(),
-  disableUser: vi.fn(), enableUser: vi.fn(), deleteUser: vi.fn(),
+  disableUser: vi.fn(), enableUser: vi.fn(), deleteUser: vi.fn(), demoteInstanceAdmin: vi.fn(),
 }));
 vi.mock("@/api/companies", () => ({ companiesApi: mocks }));
 vi.mock("@/api/auth", () => ({ authApi: mocks }));
@@ -189,6 +189,24 @@ describe("InstanceAccess account actions", () => {
     expect(button("Disable user")).toBeUndefined();
     await act(async () => button("Enable user")!.click());
     await eventually(() => expect(mocks.enableUser).toHaveBeenCalledWith(member.id));
+  });
+
+  it("surfaces the server's refusal to remove the last instance admin", async () => {
+    mocks.demoteInstanceAdmin.mockRejectedValue(new ApiError(
+      "Cannot remove the last active instance admin",
+      409,
+      { code: "instance_user_last_admin" },
+    ));
+    await renderPage();
+    await eventually(() => expect(button("Remove instance admin")).toBeDefined());
+    await act(async () => button("Remove instance admin")!.click());
+    await eventually(() => expect(mocks.pushToast).toHaveBeenCalledWith(expect.objectContaining({
+      title: "Could not update instance role",
+      body: "Cannot remove the last active instance admin",
+      tone: "error",
+    })));
+    expect(mocks.demoteInstanceAdmin).toHaveBeenCalledWith(user.id);
+    expect(button("Remove instance admin")!.disabled).toBe(false);
   });
 
   it("surfaces the server's refusal to delete a user with history", async () => {

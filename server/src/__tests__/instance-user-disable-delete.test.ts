@@ -11,7 +11,7 @@ import type { AddressInfo } from "node:net";
 import express from "express";
 import WebSocket from "ws";
 import request from "supertest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -96,6 +96,36 @@ describeEmbeddedPostgres("instance admin user disable and delete", () => {
       })
       .returning()
       .then((rows) => rows[0]!);
+  }
+
+  async function createPendingJoinRequest(companyId: string, applicant: { id: string; email: string }) {
+    const [invite] = await db
+      .insert(invites)
+      .values({ companyId, tokenHash: randomUUID(), expiresAt: new Date(Date.now() + 60_000) })
+      .returning();
+    return db
+      .insert(joinRequests)
+      .values({
+        inviteId: invite!.id,
+        companyId,
+        requestType: "human",
+        requestIp: "127.0.0.1",
+        requestingUserId: applicant.id,
+        requestEmailSnapshot: applicant.email,
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+  }
+
+  /** Waits until another connection is blocked waiting for a row lock. */
+  async function waitForAccountLockWaiter() {
+    await vi.waitFor(async () => {
+      const [row] = await db.execute<{ count: number }>(sql`
+        select count(*)::int as count from pg_locks
+        where not granted and locktype = 'transactionid'
+      `);
+      expect(row!.count).toBeGreaterThan(0);
+    }, { timeout: 10_000, interval: 20 });
   }
 
   beforeAll(async () => {
@@ -424,6 +454,99 @@ describeEmbeddedPostgres("instance admin user disable and delete", () => {
 
     expect(await db.select().from(authUsers).where(eq(authUsers.id, member.id))).toHaveLength(1);
     expect(await db.select().from(authUsers).where(eq(authUsers.id, formerAdmin.id))).toHaveLength(1);
+  });
+
+  it("orders join approval and account deletion on the account lock", async () => {
+    const { instanceUserService, lockUserAccount } = await import("../services/instance-users.js");
+    const admin = await signUp("approver");
+    await makeAdmin(admin.id);
+    const company = await createCompany();
+    await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "user",
+      principalId: admin.id,
+      status: "active",
+      membershipRole: "owner",
+    });
+
+    // Deletion holds the account first: the approval waits, then finds the
+    // account gone and creates no membership.
+    const deleted = await signUp("deleted-applicant");
+    const deletedRequest = await createPendingJoinRequest(company.id, deleted);
+    let approval!: Promise<request.Response>;
+    await db.transaction(async (tx) => {
+      await lockUserAccount(tx, deleted.id, "update");
+      approval = request(app)
+        .post(`/api/companies/${company.id}/join-requests/${deletedRequest.id}/approve`)
+        .set("cookie", admin.cookie)
+        .then((response) => response);
+      await waitForAccountLockWaiter();
+      await instanceUserService(tx as unknown as Db).deleteUser({ userId: deleted.id, actorUserId: admin.id });
+    });
+    const refused = await approval;
+    expect(refused.status).toBe(409);
+    expect(
+      await db.select().from(companyMemberships).where(eq(companyMemberships.principalId, deleted.id)),
+    ).toHaveLength(0);
+    const [closed] = await db.select().from(joinRequests).where(eq(joinRequests.id, deletedRequest.id));
+    expect(closed?.status).toBe("rejected");
+
+    // Approval holds the account first: the deletion waits, then sees the new
+    // membership and refuses.
+    const approved = await signUp("approved-applicant");
+    let deletion!: Promise<unknown>;
+    await db.transaction(async (tx) => {
+      await lockUserAccount(tx, approved.id, "key share");
+      deletion = instanceUserService(db)
+        .deleteUser({ userId: approved.id, actorUserId: admin.id })
+        .then(() => null, (error: unknown) => error);
+      await waitForAccountLockWaiter();
+      await tx.insert(companyMemberships).values({
+        companyId: company.id,
+        principalType: "user",
+        principalId: approved.id,
+        status: "active",
+        membershipRole: "operator",
+      });
+    });
+    expect(await deletion).toMatchObject({ status: 409, details: { code: "instance_user_has_history" } });
+    expect(await db.select().from(authUsers).where(eq(authUsers.id, approved.id))).toHaveLength(1);
+
+    // Without a concurrent deletion the approval goes through as before.
+    const joiner = await signUp("joiner");
+    const joinerRequest = await createPendingJoinRequest(company.id, joiner);
+    const accepted = await request(app)
+      .post(`/api/companies/${company.id}/join-requests/${joinerRequest.id}/approve`)
+      .set("cookie", admin.cookie);
+    expect(accepted.status).toBe(200);
+    expect(accepted.body).toMatchObject({ status: "approved", approvedByUserId: admin.id });
+    expect(
+      await db.select().from(companyMemberships).where(eq(companyMemberships.principalId, joiner.id)),
+    ).toMatchObject([{ status: "active" }]);
+  });
+
+  it("returns the fresh block when an enable lands while disabling an already disabled user", async () => {
+    const { instanceUserService, lockUserAccount } = await import("../services/instance-users.js");
+    const admin = await signUp("racer");
+    await makeAdmin(admin.id);
+    const target = await signUp("raced");
+    const service = instanceUserService(db);
+    await service.disableUser({ userId: target.id, actorUserId: admin.id, reason: "first" });
+
+    let disabling!: Promise<Awaited<ReturnType<typeof service.disableUser>>>;
+    await db.transaction(async (tx) => {
+      await lockUserAccount(tx, target.id, "update");
+      disabling = service.disableUser({ userId: target.id, actorUserId: admin.id, reason: "second" });
+      await waitForAccountLockWaiter();
+      await instanceUserService(tx as unknown as Db).enableUser({ userId: target.id, actorUserId: admin.id });
+    });
+
+    await expect(disabling).resolves.toMatchObject({ status: "disabled", reason: "second" });
+    const open = await db
+      .select()
+      .from(userDisablements)
+      .where(and(eq(userDisablements.userId, target.id), sql`${userDisablements.enabledAt} is null`));
+    expect(open).toHaveLength(1);
   });
 
   it("lets the implicit local board manage admins but never be disabled itself", async () => {
