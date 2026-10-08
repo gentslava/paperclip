@@ -122,7 +122,8 @@ async function lookupCodexSubscriptionModels(
         { companyId, connectionId: row.connection.id, status: error instanceof Error ? /\b(\d{3})\b/.exec(error.message)?.[1] : undefined },
         "Codex subscription model catalog unavailable",
       );
-      catalogs.delete(key);
+      // Drop only this request's entry; a Refresh may have replaced it already.
+      if (catalogs.get(key)?.models === models) catalogs.delete(key);
       return [] as AdapterModel[];
     });
     catalogs.delete(key);

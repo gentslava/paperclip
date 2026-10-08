@@ -108,6 +108,19 @@ describe("Codex subscription model catalog", () => {
     await expect(listCodexSubscriptionModels(db, "company", "user", { budgetMs: 20 })).resolves.toEqual([]);
   });
 
+  it("keeps a refreshed catalog when an older request fails afterwards", async () => {
+    mocks.accounts.mockResolvedValue([account("chatgpt")]);
+    let failSlowRequest!: (error: Error) => void;
+    mocks.catalog.mockReturnValueOnce(new Promise((_resolve, reject) => { failSlowRequest = reject; }));
+    const slow = listCodexSubscriptionModels(db, "company", "user");
+    await vi.waitFor(() => expect(mocks.catalog).toHaveBeenCalledTimes(1));
+    await expect(listCodexSubscriptionModels(db, "company", "user", { refresh: true })).resolves.toHaveLength(1);
+    failSlowRequest(new Error("chatgpt codex models api returned 503"));
+    await expect(slow).resolves.toEqual([]);
+    await listCodexSubscriptionModels(db, "company", "user");
+    expect(mocks.catalog).toHaveBeenCalledTimes(2);
+  });
+
   describe("cache bounds", () => {
     afterEach(() => { vi.useRealTimers(); });
 
