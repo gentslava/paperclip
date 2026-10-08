@@ -42,6 +42,18 @@ export function AuthPage() {
     retry: false,
   });
 
+  // Servers that predate the field omit it; keep offering sign-up there, as before.
+  const signUpMode = healthQuery.data?.authSignUpMode ?? "open";
+
+  // Registration can close while the sign-up form is open (a health refresh
+  // sees the new mode). Return to sign-in, which is the only form that works.
+  useEffect(() => {
+    if (signUpMode !== "open" && mode === "sign_up") {
+      setMode("sign_in");
+      setError(null);
+    }
+  }, [signUpMode, mode]);
+
   useEffect(() => {
     if (session) {
       clearCloudSignInAttempt();
@@ -98,9 +110,6 @@ export function AuthPage() {
   if (healthQuery.data?.cloud) {
     return <CloudSignIn cloud={healthQuery.data.cloud} returnTo={nextPath} />;
   }
-
-  // Servers that predate the field omit it; keep offering sign-up there, as before.
-  const signUpMode = healthQuery.data?.authSignUpMode ?? "open";
 
   return (
     <div className="fixed inset-0 flex bg-background">
