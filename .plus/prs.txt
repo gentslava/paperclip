@@ -1,23 +1,21 @@
 # Upstream PRs (paperclipai/paperclip) merged on top of master, in this order.
 # One number per line; text after "#" is a comment. Merged/closed PRs are skipped automatically.
-13726  # fix(ai-connections): rotate Claude subscription credentials from a file (Claude login refresh)
-14027  # fix(agents): let bound agents be edited and unbound from AI connections
+13726@rebase/13726-claude-credential-refresh  # fix(ai-connections): rotate Claude subscription credentials from a file (Claude login refresh); our rebase onto master, upstream PR conflicts since #14967/#14970/#14994
+14027@rebase/14027-bound-agent-edit  # fix(agents): let bound agents be edited and unbound from AI connections; our rebase onto master
 10862  # Make agent role editable after creation
 14147  # fix(claude-local): show the ANTHROPIC_MODEL default in the model picker (ours)
 14224  # fix(ai-connections): reactivate an archived provider application on connect (ours)
-14328  # fix(ui): make destructive-foreground readable in the light theme (ours)
 14257  # fix(heartbeat): keep wakeup reads on their transaction connection (pool deadlock, #14196/#14197)
+15534  # feat(codex-local): list the ChatGPT subscription's Codex catalog in the model picker (ours)
 # Community fixes (reviewed, tests green on top of the list above)
 13647  # fix(claude-local): stop scanning the raw transcript for login prompts
 14089  # fix(claude-local): gate claude_auth_required on a failed run
 13885  # fix(claude-local): stop sealing max-turns failures as model_not_found
-14039  # fix(claude-local): map thinking effort to the selected model
+14039@rebase/14039-claude-thinking-effort-per-model  # fix(claude-local): map thinking effort to the selected model; our rebase onto master
 13566  # fix(server): restore top-level redacted adapter secrets on agent update
 # Picked with PR Scout (Jev) + manual review, 2026-09-27; merge + typecheck verified on top of the list above
-12842  # fix(agents): merge runtimeConfig on PATCH instead of replacing the column
+12842@rebase/12842-runtimeconfig-patch-merge  # fix(agents): merge runtimeConfig on PATCH instead of replacing the column; our rebase onto master
 12870  # fix(adapter-utils): strip DATABASE_URL and BETTER_AUTH_SECRET from inherited agent env
-13833  # fix(server): bind run context to the checked-out issue so taskless runs can write
-13782  # fix: keep the requesting run alive when an agent hands off its own issue
-14012  # fix(heartbeat): bind run-scoped runtime gateways to their agent
+13833@rebase/13833-run-context-checked-out-issue  # fix(server): bind run context to the checked-out issue; our rebase onto master
 7432   # fix(issues): resolve identifier to UUID for parentId/descendantOf filters
 12117  # fix(skill): teach agents that PAPERCLIP_API_URL excludes the /api prefix

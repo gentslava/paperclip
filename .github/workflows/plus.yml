@@ -44,14 +44,24 @@ jobs:
         run: |
           set -euo pipefail
           included=()
-          while read -r pr _; do
-            [ -z "$pr" ] && continue
+          while read -r entry _; do
+            [ -z "$entry" ] && continue
+            # "N" merges pull/N/head. "N@branch" merges our rebased copy of PR N
+            # from this repo's branch instead, until N is merged or closed upstream.
+            pr="${entry%%@*}"
+            branch=""
+            [ "$entry" != "$pr" ] && branch="${entry#*@}"
             state="$(gh api "repos/paperclipai/paperclip/pulls/$pr" --jq 'if .merged then "merged" else .state end')"
             if [ "$state" != "open" ]; then
               echo "::notice::#$pr is $state upstream, skipped"
               continue
             fi
-            git fetch -q --no-tags origin "pull/$pr/head:pr-$pr"
+            if [ -n "$branch" ]; then
+              git fetch -q --no-tags "https://github.com/${GITHUB_REPOSITORY}.git" "refs/heads/$branch:pr-$pr"
+              echo "::notice::#$pr merged from ${GITHUB_REPOSITORY}@$branch (our rebase onto master)"
+            else
+              git fetch -q --no-tags origin "pull/$pr/head:pr-$pr"
+            fi
             if ! git merge -q --no-ff --no-edit -m "plus: merge upstream PR #$pr" "pr-$pr"; then
               git diff --name-only --diff-filter=U
               echo "::error::#$pr does not merge cleanly on upstream master"
