@@ -4109,7 +4109,6 @@ describe("AgentConfigForm Role field", () => {
   let roots: Root[] = [];
 
   beforeEach(() => {
-    mockAgentsApi.adapterModelProfiles.mockResolvedValue([]);
     mockAgentsApi.adapterModels.mockResolvedValue([]);
     mockAgentsApi.detectModel.mockResolvedValue(null);
     mockAgentsApi.list.mockResolvedValue([]);
