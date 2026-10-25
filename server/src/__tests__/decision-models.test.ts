@@ -22,6 +22,7 @@ import express from "express";
 import request from "supertest";
 import { decisionModelRoutes } from "../routes/decision-models.js";
 import { errorHandler } from "../middleware/index.js";
+import { deliverBudgetEnforcement } from "../services/budgets.js";
 
 let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
 let db: ReturnType<typeof createDb>;
@@ -53,6 +54,36 @@ async function fixture() {
   return { companyId, agentId, binding, provider, service, context, config, connections };
 }
 describe("company decision service", () => {
+  it("returns answers and a committed charge before slow budget stop delivery", async () => {
+    const f = await fixture();
+    await db.insert(budgetPolicies).values({ companyId: f.companyId, scopeType: "company", scopeId: f.companyId,
+      windowKind: "calendar_month_utc", amount: 1, notifyEnabled: false });
+    f.provider.mockResolvedValue({ ...structuredClone(outcome), receipt: { ...outcome.receipt, costCents: "2.0000000" } });
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const cancelWorkForScope = vi.fn(() => gate);
+    const service = decisionModelService(db, { provider: f.provider, budgetHooks: { cancelWorkForScope } });
+    const pending = service.decide(f.context, DECISION_TEST_REQUEST);
+    let delivery: Promise<void> | undefined;
+    let finished = false;
+    void pending.then(() => { finished = true; }, () => { finished = true; });
+    try {
+      await vi.waitFor(() => expect(finished).toBe(true), { timeout: 3000 });
+      expect(await pending).toMatchObject({ status: "succeeded", answers: outcome.answers });
+      expect(f.provider).toHaveBeenCalledOnce();
+      expect(cancelWorkForScope).not.toHaveBeenCalled();
+      const events = await db.select().from(costEvents).where(eq(costEvents.companyId, f.companyId));
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({ usageKind: "decision", costCents: 2 });
+      const [policy] = await db.select().from(budgetPolicies).where(eq(budgetPolicies.companyId, f.companyId));
+      expect(policy.enforcementVersion).toBeGreaterThan(policy.enforcementDeliveredVersion);
+      delivery = deliverBudgetEnforcement(db, { cancelWorkForScope }, f.companyId);
+      await vi.waitFor(() => expect(cancelWorkForScope).toHaveBeenCalledOnce());
+      expect((await db.select().from(budgetPolicies).where(eq(budgetPolicies.id, policy.id)))[0].enforcementDeliveredVersion).toBe(policy.enforcementDeliveredVersion);
+      release(); await delivery;
+      expect((await db.select().from(budgetPolicies).where(eq(budgetPolicies.id, policy.id)))[0].enforcementDeliveredVersion).toBe(policy.enforcementVersion);
+    } finally { release(); await pending.catch(() => undefined); await delivery?.catch(() => undefined); }
+  });
   it("starts unconfigured with background sponsorship on and makes availability free", async () => {
     const f = await fixture();
     await db.delete(companyDecisionModels).where(eq(companyDecisionModels.companyId, f.companyId));
@@ -189,12 +220,16 @@ describe("company decision service", () => {
     const context: DecisionContext = { companyId: f.companyId, feature: settingsDecisionTest,
       actor: { type: "agent", agentId: f.agentId, runId, companyId: f.companyId, source: "agent_jwt" } };
     const remove = () => agentService(db).remove(f.agentId);
+    let inFlightDeletionError: unknown;
     f.provider.mockImplementationOnce(async () => {
-      await expect(remove()).rejects.toMatchObject({ status: 409, details: { code: "agent_decision_accounting_pending" } });
+      // Exercise the accounting guard after lifecycle termination.
+      await db.update(agents).set({ status: "terminated", lifecycleState: "terminated" }).where(eq(agents.id, f.agentId));
+      inFlightDeletionError = await remove().catch(error => error);
       expect(await f.service.decide(f.context, DECISION_TEST_REQUEST)).toMatchObject({ status: "unavailable", reason: "budget_blocked" });
       return { errorCode: "timeout", receipt: decisionReceipt("openai", null) };
     });
     expect((await f.service.decide(context, DECISION_TEST_REQUEST)).status).toBe("failed");
+    expect(inFlightDeletionError).toMatchObject({ status: 409, details: { code: "agent_decision_accounting_pending" } });
     await expect(remove()).rejects.toMatchObject({ status: 409, details: { code: "agent_decision_accounting_pending" } });
     expect((await db.select().from(budgetReservations).where(eq(budgetReservations.companyId, f.companyId)))[0]).toMatchObject({ state: "held", amountCents: "1.0000000" });
   });

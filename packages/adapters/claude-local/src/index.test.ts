@@ -44,9 +44,9 @@ describe("Claude model defaults", () => {
     expect(resolveClaudeReasoningEffort("claude-opus-5", undefined)).toBe("");
   });
 
-  it.each([undefined, null, "", "  "])("uses Opus 5 for an unset model (%j)", (model) => {
-    expect(DEFAULT_CLAUDE_LOCAL_MODEL).toBe("claude-opus-5");
-    expect(resolveClaudeModel(model)).toBe("claude-opus-5");
+  it.each([undefined, null, "", "  "])("uses Opus 5.5 for an unset model (%j)", (model) => {
+    expect(DEFAULT_CLAUDE_LOCAL_MODEL).toBe("claude-opus-5-5");
+    expect(resolveClaudeModel(model)).toBe("claude-opus-5-5");
   });
 
   it("strips an unsupported --effort pair smuggled through extraArgs", () => {
