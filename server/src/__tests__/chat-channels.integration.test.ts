@@ -24,7 +24,7 @@ import { toolActionRequests, toolInvocations, toolPolicies } from "@paperclipai/
 import { GitHubPublicationLeaseLost, withGitHubPublicationLease } from "../services/chat-github-publication-lease.js";
 import { secretService } from "../services/secrets.js";
 import { githubChatWizardService } from "../services/chat-github-wizard.js";
-import { dispatchGitHubBotCloudEvent } from "../services/chat-github-cloud-ingress.js";
+import { dispatchGitHubBotCloudEvent, registerGitHubBotCloudSetupPoller } from "../services/chat-github-cloud-ingress.js";
 import { githubChatManagementService } from "../services/chat-github-management.js";
 import { githubChatReviewService } from "../services/chat-github-reviews.js";
 import { resolveGitHubReviewInstructions } from "../services/chat-channels/github/review-instructions.js";
@@ -5135,13 +5135,22 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         (await f.service.get(f.endpoint.id)).setup.webhookVerifiedAt,
       ).toBeNull();
       expect(f.wakeup).not.toHaveBeenCalled();
-      event.payload.githubApp.headers["x-hub-signature-256"] =
-        `sha256=${createHmac("sha256", f.webhookSecret).update(body).digest("hex")}`;
-      expect(await dispatchGitHubBotCloudEvent(db, event)).toBe(true);
-      expect(
-        (await f.service.get(f.endpoint.id)).setup.webhookVerifiedAt,
-      ).toBeTruthy();
-      expect(f.wakeup).not.toHaveBeenCalled();
+      const poll = vi.fn(async () => { await dispatchGitHubBotCloudEvent(db, event); });
+      const unregister = registerGitHubBotCloudSetupPoller(db, poll);
+      try {
+        const waiting = await f.service.githubWizard.advance(f.endpoint.id, "owner-user");
+        expect(waiting.state).toBe("verify");
+        expect(poll).toHaveBeenCalledOnce();
+        expect((await f.service.get(f.endpoint.id)).setup.webhookVerifiedAt).toBeNull();
+        event.payload.githubApp.headers["x-hub-signature-256"] =
+          `sha256=${createHmac("sha256", f.webhookSecret).update(body).digest("hex")}`;
+        const ready = await f.service.githubWizard.advance(f.endpoint.id, "owner-user");
+        expect(ready.state).not.toBe("verify");
+        expect((await f.service.get(f.endpoint.id)).setup.webhookVerifiedAt).toBeTruthy();
+        expect(f.wakeup).not.toHaveBeenCalled();
+        await f.service.githubWizard.advance(f.endpoint.id, "owner-user");
+        expect(poll).toHaveBeenCalledTimes(2);
+      } finally { unregister(); }
     });
     it("legacy name-only registration preserves an explicit empty repository selection", async () => {
       const fixture = await seedCompany();
