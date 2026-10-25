@@ -3,7 +3,7 @@ import { claudeDefaultModelName } from "./claude-default-model";
 
 describe("claudeDefaultModelName", () => {
   it("uses the built-in default without overrides", () => {
-    expect(claudeDefaultModelName({ runsOnHost: true })).toBe("claude-opus-5");
+    expect(claudeDefaultModelName({ runsOnHost: true })).toBe("claude-opus-5-5");
   });
 
   it("uses the host model for runs on the host", () => {
@@ -11,7 +11,7 @@ describe("claudeDefaultModelName", () => {
   });
 
   it("ignores the host model for remote runs", () => {
-    expect(claudeDefaultModelName({ hostModel: "claude-opus-5-5", runsOnHost: false })).toBe("claude-opus-5");
+    expect(claudeDefaultModelName({ hostModel: "claude-opus-5-5", runsOnHost: false })).toBe("claude-opus-5-5");
   });
 
   it("prefers the agent's plain ANTHROPIC_MODEL", () => {
@@ -34,7 +34,7 @@ describe("claudeDefaultModelName", () => {
         hostModel: "claude-opus-5-5",
         runsOnHost: true,
       }),
-    ).toBe("claude-opus-5");
+    ).toBe("claude-opus-5-5");
   });
 
   it("returns null when a secret supplies the agent's ANTHROPIC_MODEL", () => {
