@@ -19,6 +19,9 @@ use paperclip_runner_core::provider_bridge::{
 use paperclip_runner_core::provider_events::normalize_codex_notification;
 use serde_json::{json, Value};
 
+#[path = "support/codex_assigned_tool_validation.rs"]
+mod assigned_tool_validation;
+
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 static RECEIPT_LIMIT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -65,7 +68,9 @@ fn provider_config(directory: &Path, switches: &[&str]) -> CodexProviderConfig {
         instructions: "Stay inside the test workspace.".to_owned(),
         approval_policy: "never".to_owned(),
         externally_sandboxed: false,
+        read_only: false,
         include_skill_instructions: None,
+        conversation_mode: None,
     }
 }
 
@@ -101,6 +106,19 @@ fn provider_receives_the_isolated_codex_auth_home() {
         .env("PAPERCLIP_CODEX_AUTH_TEST_HOME", &directory)
         .env("HOME", &directory)
         .env("CODEX_HOME", &directory)
+        .env(
+            "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+            "authorization=Bearer%20logs-fixture",
+        )
+        .env(
+            "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+            "authorization=Bearer%20traces-fixture",
+        )
+        .env(
+            "OTEL_EXPORTER_OTLP_HEADERS",
+            "authorization=unwanted-ambient",
+        )
+        .env("OTEL_EXPORTER_OTLP_ENDPOINT", "https://unwanted.example")
         .status()
         .expect("run isolated auth-home assertion");
     assert!(status.success());
@@ -114,7 +132,10 @@ fn provider_receives_isolated_codex_auth_home_subprocess() {
     else {
         return;
     };
-    let config = provider_config(&directory, &["--require-codex-home-auth"]);
+    let config = provider_config(
+        &directory,
+        &["--require-codex-home-auth", "--require-otel-environment"],
+    );
     let mut provider = CodexProvider::start(&config, None)
         .expect("Codex provider should read auth from the isolated CODEX_HOME");
     provider.shutdown().expect("stop fake Codex provider");
@@ -544,6 +565,102 @@ fn saturate_provider_tool_receipts(directory: &Path) {
         .expect("write saturated provider state");
 }
 
+fn read_receipt_limit_state(directory: &Path) -> Value {
+    serde_json::from_slice(
+        &fs::read(directory.join("codex-provider-state.json")).expect("read receipt-limit state"),
+    )
+    .expect("parse receipt-limit state")
+}
+
+fn seed_pending_receipt_limit_retry(directory: &Path) {
+    let original = read_receipt_limit_state(directory);
+    assert!(!original["activeProviderTurnId"].is_null());
+    assert_eq!(original["receiptLimitDiagnosticEmitted"], false);
+    assert_eq!(original["receiptLimitInterruptPending"], false);
+    assert_eq!(original["receiptLimitInterruptAccepted"], false);
+    assert_eq!(original["receiptLimitInterruptAttempts"], 0);
+    assert!(original["receiptLimitInterruptDeadlineUnixMs"].is_null());
+    let mut seeded = original.clone();
+    seeded["receiptLimitDiagnosticEmitted"] = json!(true);
+    seeded["receiptLimitInterruptPending"] = json!(true);
+    seeded["receiptLimitInterruptDeadlineUnixMs"] = json!(u64::MAX);
+    let mut reverse = seeded.clone();
+    for field in [
+        "receiptLimitDiagnosticEmitted",
+        "receiptLimitInterruptPending",
+        "receiptLimitInterruptDeadlineUnixMs",
+    ] {
+        reverse[field] = original[field].clone();
+    }
+    assert!(
+        reverse == original,
+        "only the explicit pending-stop fixture fields may change"
+    );
+    fs::write(
+        directory.join("codex-provider-state.json"),
+        serde_json::to_vec_pretty(&seeded).unwrap(),
+    )
+    .expect("write synthetic pending-stop retry fixture");
+}
+
+fn assert_at_capacity_receipts_preserved_by_stop(actual: &Value, saturated: &Value) {
+    let completed = saturated["completed"]
+        .as_object()
+        .expect("fixture completed receipts");
+    assert_eq!(completed.len(), 4096);
+    assert!(saturated["pending"].as_object().unwrap().is_empty());
+    assert!(saturated["settledResults"].as_object().unwrap().is_empty());
+    assert!(saturated["settledCallIds"].as_array().unwrap().is_empty());
+    let mut expected_ids = completed.keys().cloned().collect::<Vec<_>>();
+    expected_ids.sort();
+    assert!(actual["completed"].as_object().unwrap().is_empty());
+    assert_eq!(actual["settledResults"].as_object().unwrap().len(), 4096);
+    assert_eq!(actual["settledCallIds"].as_array().unwrap().len(), 4096);
+    assert!(
+        actual["settledResults"] == saturated["completed"],
+        "all4096 retained receipt IDs, inputs and result bodies must remain exact"
+    );
+    assert!(
+        actual["settledCallIds"] == json!(expected_ids),
+        "all4096 exact receipt identities must remain in settlement order"
+    );
+    assert!(actual["pending"].as_object().unwrap().is_empty());
+    for field in ["authorized", "catalogOperations", "catalogDigest"] {
+        assert!(
+            actual[field] == saturated[field],
+            "tool authority must remain exact"
+        );
+    }
+    let mut expected = saturated.clone();
+    expected["completed"] = json!({});
+    expected["settledResults"] = saturated["completed"].clone();
+    expected["settledCallIds"] = json!(expected_ids);
+    expected["turnClosed"] = json!(true);
+    assert!(
+        actual == &expected,
+        "the full bridge must match only the documented pre-RPC settlement transition"
+    );
+}
+
+fn wait_for_executor_event_batch(
+    executor: &mut CodexCommandExecutor,
+    expected_event_type: &str,
+) -> Vec<PolledEvent> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut retained = Vec::new();
+    while std::time::Instant::now() < deadline {
+        retained.extend(poll_and_ack(executor).expect("poll and retain the entire event batch"));
+        if retained
+            .iter()
+            .any(|event| event.event_type == expected_event_type)
+        {
+            return retained;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    panic!("did not observe Codex {expected_event_type} event before the deadline");
+}
+
 #[test]
 fn codex_transport_buffers_notifications_while_waiting_for_responses() {
     let directory = temporary_directory("buffering");
@@ -616,6 +733,14 @@ fn codex_account_updates_do_not_interrupt_turns_or_publish_account_details() {
                         assert!(!params.to_string().contains("fixture-login"));
                         assert!(params.get("authMode").is_none());
                         assert!(params.get("planType").is_none());
+                        let normalized = normalize_codex_notification(&method, &params);
+                        assert_eq!(normalized.len(), 1);
+                        assert_eq!(normalized[0].event_type, "harness.diagnostic");
+                        assert_eq!(normalized[0].payload["code"], "codex_unrelated_information");
+                        assert_eq!(
+                            normalized[0].payload["providerMethod"],
+                            params["providerMethod"]
+                        );
                     }
                     if method == "turn/completed" {
                         completed = true;
@@ -850,16 +975,21 @@ fn codex_rejects_replay_of_a_completed_tool_call_id_in_the_same_turn() {
         .start_turn("Inspect the fake task once.", &config.cwd)
         .expect("start provider turn");
 
-    let first_call = (0..32)
-        .find_map(|_| match provider.poll().expect("poll first tool call") {
-            Some(CodexProviderEvent::ToolCall {
-                call_id,
-                operation_id,
-                ..
-            }) => Some((call_id, operation_id)),
-            _ => None,
-        })
-        .expect("observe the first semantic tool call");
+    let first_call_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let first_call =
+        std::iter::from_fn(|| (std::time::Instant::now() < first_call_deadline).then_some(()))
+            .find_map(|_| match provider.poll().expect("poll first tool call") {
+                Some(CodexProviderEvent::ToolCall {
+                    call_id,
+                    operation_id,
+                    ..
+                }) => Some((call_id, operation_id)),
+                _ => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    None
+                }
+            })
+            .expect("observe the first semantic tool call");
     provider
         .deliver_tool_result(&ToolResult {
             call_id: first_call.0,
@@ -869,9 +999,17 @@ fn codex_rejects_replay_of_a_completed_tool_call_id_in_the_same_turn() {
         })
         .expect("deliver the first semantic result");
 
-    let replay_error = (0..32)
-        .find_map(|_| provider.poll().err())
-        .expect("same-turn replay of the completed call id is rejected");
+    let replay_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let replay_error =
+        std::iter::from_fn(|| (std::time::Instant::now() < replay_deadline).then_some(()))
+            .find_map(|_| {
+                let error = provider.poll().err();
+                if error.is_none() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                error
+            })
+            .expect("same-turn replay of the completed call id is rejected");
     assert!(
         replay_error
             .to_string()
@@ -3041,6 +3179,103 @@ fn codex_resume_advertises_the_same_authorized_tools() {
 }
 
 #[test]
+fn interrupted_tool_accepts_one_authoritative_result_across_restart_and_lost_ack() {
+    for restart in [false, true] {
+        let directory = temporary_directory(if restart {
+            "interrupt-tool-restart"
+        } else {
+            "interrupt-tool-live"
+        });
+        let config = provider_config(&directory, &["--require-dynamic-tool", "--emit-tool-call"]);
+        let runner_config = durable_config(&directory);
+        let mut executor = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+        executor
+            .execute(&command(
+                "prepare",
+                1,
+                "run.prepare",
+                json!({"provider":config,"authorizedTools":task_context_tool_set()}),
+            ))
+            .unwrap();
+        executor
+            .execute(&command("open", 2, "session.open", json!({})))
+            .unwrap();
+        executor
+            .execute(&command(
+                "turn",
+                3,
+                "turn.start",
+                json!({"text":"Hold the actual operation until after interruption."}),
+            ))
+            .unwrap();
+        wait_for_executor_event(&mut executor, "semantic_tool.input");
+        executor
+            .execute(&command(
+                "interrupt",
+                4,
+                "turn.interrupt",
+                json!({"reason":"test_result_delivery_barrier"}),
+            ))
+            .unwrap();
+        let saved: Value =
+            serde_json::from_slice(&fs::read(directory.join("codex-provider-state.json")).unwrap())
+                .unwrap();
+        assert_eq!(saved["toolBridge"]["pending"].as_object().unwrap().len(), 1);
+        assert!(saved["pendingEvents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["payload"]["reason"] == "test_result_delivery_barrier"));
+        if restart {
+            drop(executor);
+            executor = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+        }
+        let result = json!({"callId":"semantic-call-1", "operationId":"get_task_context", "result":{"ok":true,"savedHash":"exact-write"}, "isError":false});
+        let delivered = executor
+            .execute(&command(
+                "result",
+                5,
+                "semantic_tool.result",
+                result.clone(),
+            ))
+            .unwrap();
+        assert_eq!(delivered.result["status"], "settled_after_turn");
+        // Lose the command ACK, restart, then deliver precisely the same result.
+        drop(executor);
+        executor = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+        let replay = executor
+            .execute(&command(
+                "retry-result",
+                6,
+                "semantic_tool.result",
+                result.clone(),
+            ))
+            .unwrap();
+        assert_eq!(replay.result["status"], "duplicate");
+        assert!(replay
+            .events
+            .iter()
+            .any(|(kind, _, value)| kind == "harness.diagnostic"
+                && value["code"] == "semantic_tool_result_duplicate"
+                && value["callId"] == "semantic-call-1"));
+        let mut conflict = result;
+        conflict["result"]["savedHash"] = json!("different-write");
+        let error = executor
+            .execute(&command("conflict", 7, "semantic_tool.result", conflict))
+            .unwrap_err();
+        assert!(error.to_string().contains("semantic-call-1"));
+        assert!(error.to_string().contains("get_task_context"));
+        assert!(error.to_string().contains("conflicting duplicate"));
+        assert!(error.to_string().contains("existingDigest=sha256:"));
+        assert!(error.to_string().contains("incomingDigest=sha256:"));
+        assert!(!error.to_string().contains("different-write"));
+        assert_eq!(call_count(&directory, "turn/start"), 1);
+        executor.shutdown().unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
 fn durable_backend_routes_a_semantic_tool_result_back_to_codex() {
     let directory = temporary_directory("durable-dynamic-tool");
     let config = provider_config(&directory, &["--require-dynamic-tool", "--emit-tool-call"]);
@@ -3366,6 +3601,65 @@ fn durable_backend_replays_pending_tool_calls_without_mutating_the_event_queue()
 }
 
 #[test]
+fn restart_lost_turn_retains_a_recoverable_cause_without_inventing_a_result() {
+    let directory = temporary_directory("restart-lost-turn");
+    let config = provider_config(
+        &directory,
+        &["--durable-turn-ids", "--linger-after-turn-start"],
+    );
+    let mut first = CodexCommandExecutor::new(&directory);
+    first
+        .execute(&command(
+            "prepare",
+            1,
+            "run.prepare",
+            json!({"provider": config}),
+        ))
+        .unwrap();
+    first
+        .execute(&command("open", 2, "session.open", json!({})))
+        .unwrap();
+    first
+        .execute(&command(
+            "start",
+            3,
+            "turn.start",
+            json!({"text": "Watch the existing check run."}),
+        ))
+        .unwrap();
+    // The process disappeared while its command was in flight. Codex restores
+    // the conversation, but cannot restore the running turn.
+    drop(first);
+    fs::write(
+        directory.join("fake-state.json"),
+        serde_json::to_vec(&json!({
+            "threadId": "codex-thread-1", "activeTurnId": null, "nextTurn": 1,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut restored = CodexCommandExecutor::new(&directory);
+    restored
+        .execute(&command("snapshot", 4, "session.snapshot", json!({})))
+        .unwrap();
+    let events = poll_and_ack(&mut restored).unwrap();
+    let interrupted = events
+        .iter()
+        .find(|event| event.event_type == "turn.failed")
+        .unwrap();
+    assert_eq!(
+        interrupted.payload["error"]["code"],
+        "provider_turn_lost_on_restore"
+    );
+    assert_eq!(interrupted.payload["error"]["recoverable"], true);
+    assert!(!events
+        .iter()
+        .any(|event| event.event_type == "run.result.proposed"));
+    restored.shutdown().unwrap();
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn durable_backend_settles_pending_tools_when_recovery_finds_the_turn_ended() {
     let directory = temporary_directory("durable-tool-ended-offline");
     let config = provider_config(&directory, &["--require-dynamic-tool", "--emit-tool-call"]);
@@ -3436,33 +3730,15 @@ fn durable_backend_settles_pending_tools_when_recovery_finds_the_turn_ended() {
             break;
         }
     }
-    let semantic_result = observed
-        .iter()
-        .position(|event| event == "semantic_tool.result")
-        .expect("recovery settles the pending semantic tool");
-    let reconciled = observed
-        .iter()
-        .position(|event| event == "session.reconciled")
-        .expect("recovery emits a reconciliation event");
-    let terminal = observed
-        .iter()
-        .position(|event| event == "run.terminal")
-        .expect("offline turn recovery terminates the run");
-    assert!(semantic_result < reconciled);
-    assert!(reconciled < terminal);
-    assert!(recovered
-        .execute(&command(
-            "late-result",
-            5,
-            "semantic_tool.result",
-            json!({
-                "callId": "semantic-call-1",
-                "operationId": "get_task_context",
-                "result": {"ok": true},
-                "isError": false,
-            }),
-        ))
-        .is_err());
+    assert!(
+        !observed.iter().any(|event| event == "semantic_tool.result"),
+        "recovery must not invent an effect outcome"
+    );
+    assert!(observed.iter().any(|event| event == "session.reconciled"));
+    let late = recovered.execute(&command("late-result", 5, "semantic_tool.result", json!({
+        "callId":"semantic-call-1", "operationId":"get_task_context", "result":{"ok":true}, "isError":false,
+    }))).unwrap();
+    assert_eq!(late.result["status"], "settled_after_turn");
 
     recovered.shutdown().expect("stop recovered provider");
     fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
@@ -3962,28 +4238,12 @@ fn durable_backend_settles_tools_before_a_natural_terminal_event() {
             break;
         }
     }
-    let semantic_result = observed
-        .iter()
-        .position(|event| event == "semantic_tool.result")
-        .expect("terminal settlement emits a failed semantic result");
-    let terminal = observed
-        .iter()
-        .position(|event| event == "turn.completed")
-        .expect("provider terminal event is emitted");
-    assert!(semantic_result < terminal);
-    assert!(executor
-        .execute(&command(
-            "late-result",
-            4,
-            "semantic_tool.result",
-            json!({
-                "callId": "semantic-call-1",
-                "operationId": "get_task_context",
-                "result": {"ok": true},
-                "isError": false,
-            }),
-        ))
-        .is_err());
+    assert!(!observed.iter().any(|event| event == "semantic_tool.result"));
+    assert!(observed.iter().any(|event| event == "turn.completed"));
+    let late = executor.execute(&command("late-result", 4, "semantic_tool.result", json!({
+        "callId":"semantic-call-1", "operationId":"get_task_context", "result":{"ok":true}, "isError":false,
+    }))).unwrap();
+    assert_eq!(late.result["status"], "settled_after_turn");
 
     executor.shutdown().unwrap();
     fs::remove_dir_all(directory).unwrap();
@@ -4153,27 +4413,15 @@ fn durable_stop_settles_pending_semantic_tools_without_a_courtesy_interrupt() {
         .execute(&command("stop", 4, "turn.stop", json!({})))
         .unwrap();
     assert_eq!(stopped.result["providerExitConfirmed"], true);
-    let result = wait_for_executor_event(&mut executor, "semantic_tool.result");
-    assert_eq!(result.payload["semantic_tool"]["outcome"], "failed");
-    assert_eq!(
-        result.payload["semantic_tool"]["callId"],
-        input.payload["semantic_tool"]["callId"]
-    );
-    assert_eq!(
-        result.payload["semantic_tool"]["correlation"],
-        input.payload["semantic_tool"]["correlation"]
-    );
-    assert!(executor
-        .execute(&command(
-            "late-result",
-            5,
-            "semantic_tool.result",
-            json!({
-                "callId": "semantic-call-1", "operationId": "get_task_context",
-                "result": {"ok": true}, "isError": false,
-            })
-        ))
-        .is_err());
+    assert_eq!(input.payload["semantic_tool"]["callId"], "semantic-call-1");
+    assert!(!poll_and_ack(&mut executor)
+        .unwrap()
+        .iter()
+        .any(|event| event.event_type == "semantic_tool.result"));
+    let late = executor.execute(&command("late-result", 5, "semantic_tool.result", json!({
+        "callId":"semantic-call-1", "operationId":"get_task_context", "result":{"ok":true}, "isError":false,
+    }))).unwrap();
+    assert_eq!(late.result["status"], "settled_after_turn");
     assert_eq!(call_count(&directory, "turn/interrupt"), 0);
     assert_eq!(call_count(&directory, "thread/start"), 1);
     assert_eq!(call_count(&directory, "turn/start"), 1);
@@ -4873,7 +5121,7 @@ fn provider_exit_preserves_and_reconciles_the_active_turn() {
 }
 
 #[test]
-fn receipt_limit_rejects_the_call_and_keeps_polling_when_interrupt_fails() {
+fn receipt_limit_retries_at_capacity_pending_stop_through_authoritative_terminal() {
     let _receipt_limit_test = lock_receipt_limit_test();
     let directory = temporary_directory("receipt-limit-interrupt-failure");
     let config = provider_config(
@@ -4907,29 +5155,84 @@ fn receipt_limit_rejects_the_call_and_keeps_polling_when_interrupt_fails() {
             "turn",
             3,
             "turn.start",
-            json!({"text": "Hold this saturated turn for recovery."}),
+            json!({"text": "Advance an at-capacity pending receipt-limit interruption."}),
         ))
         .expect("start held provider turn");
     drop(first);
 
     saturate_provider_tool_receipts(&directory);
+    let saturated_bridge = read_receipt_limit_state(&directory)["toolBridge"].clone();
+    seed_pending_receipt_limit_retry(&directory);
 
     let mut recovered = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
-    let resumed = wait_for_executor_event(&mut recovered, "session.resumed");
-    assert_eq!(resumed.payload["provider"], "codex");
-    let diagnostic = wait_for_executor_event(&mut recovered, "harness.diagnostic");
-    assert_eq!(
-        diagnostic.payload["code"],
-        "semantic_tool_turn_receipt_limit"
-    );
+    let mut emitted = wait_for_executor_event_batch(&mut recovered, "session.resumed");
+    assert!(emitted.iter().any(|event| {
+        event.event_type == "session.resumed" && event.payload["provider"] == "codex"
+    }));
     assert_eq!(call_count(&directory, "tool-response:failure"), 1);
     assert_eq!(call_count(&directory, "turn/interrupt"), 1);
-    let interrupted = wait_for_executor_event(&mut recovered, "turn.interrupted");
+    let failed_attempt = read_receipt_limit_state(&directory);
+    assert_at_capacity_receipts_preserved_by_stop(&failed_attempt["toolBridge"], &saturated_bridge);
+    assert_eq!(failed_attempt["receiptLimitInterruptPending"], true);
+    assert_eq!(failed_attempt["receiptLimitInterruptAccepted"], false);
+    assert_eq!(failed_attempt["receiptLimitInterruptAttempts"], 1);
     assert_eq!(
-        interrupted.payload["provider"], "codex",
-        "the retry must settle the receipt-exhausted turn"
+        failed_attempt["receiptLimitInterruptDeadlineUnixMs"],
+        json!(u64::MAX)
     );
+    let process_generation = failed_attempt["providerProcessGeneration"].clone();
+    let resumed_calls = call_count(&directory, "thread/resume");
+
+    emitted.extend(poll_and_ack(&mut recovered).expect("retry the first failed interrupt"));
+    assert_eq!(call_count(&directory, "turn/interrupt"), 2);
+    let accepted_attempt = read_receipt_limit_state(&directory);
+    assert_eq!(call_count(&directory, "tool-response:failure"), 1);
+    assert_at_capacity_receipts_preserved_by_stop(
+        &accepted_attempt["toolBridge"],
+        &saturated_bridge,
+    );
+    assert_eq!(accepted_attempt["receiptLimitInterruptPending"], true);
+    assert_eq!(accepted_attempt["receiptLimitInterruptAccepted"], true);
+    assert_eq!(accepted_attempt["receiptLimitInterruptAttempts"], 2);
+    assert_eq!(
+        accepted_attempt["receiptLimitInterruptDeadlineUnixMs"],
+        json!(u64::MAX)
+    );
+    assert_eq!(
+        accepted_attempt["providerProcessGeneration"],
+        process_generation
+    );
+    assert!(!emitted.iter().any(|event| {
+        event.event_type == "turn.interrupted" || event.event_type == "turn.failed"
+    }));
+
+    emitted.extend(wait_for_executor_event_batch(
+        &mut recovered,
+        "turn.interrupted",
+    ));
+    let interrupted = emitted
+        .iter()
+        .find(|event| event.event_type == "turn.interrupted")
+        .expect("the third actual RPC must produce its authoritative terminal");
+    assert_eq!(interrupted.payload["provider"], "codex");
+    assert_ne!(
+        interrupted.payload["code"],
+        "semantic_tool_turn_receipt_limit_interrupt_deadline"
+    );
+    assert!(!emitted
+        .iter()
+        .any(|event| event.event_type == "turn.failed"));
     assert_eq!(call_count(&directory, "turn/interrupt"), 3);
+    assert_eq!(call_count(&directory, "tool-response:failure"), 1);
+    assert_eq!(call_count(&directory, "thread/resume"), resumed_calls);
+    let settled = read_receipt_limit_state(&directory);
+    assert_eq!(settled["providerProcessGeneration"], process_generation);
+    assert_eq!(settled["lifecycle"], "session_open");
+    assert!(settled["activeProviderTurnId"].is_null());
+    assert_eq!(settled["receiptLimitInterruptPending"], false);
+    assert_eq!(settled["receiptLimitInterruptAccepted"], false);
+    assert_eq!(settled["receiptLimitInterruptAttempts"], 0);
+    assert!(settled["receiptLimitInterruptDeadlineUnixMs"].is_null());
 
     recovered.shutdown().expect("stop recovered provider");
     fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
@@ -4969,22 +5272,31 @@ fn receipt_limit_retry_preserves_a_turn_settled_during_provider_recovery() {
             "turn",
             3,
             "turn.start",
-            json!({"text": "Recover a provider-settled receipt-limited turn."}),
+            json!({"text": "Recover an at-capacity pending stop settled by its provider."}),
         ))
         .expect("start held provider turn");
     drop(first);
 
     saturate_provider_tool_receipts(&directory);
+    let saturated_bridge = read_receipt_limit_state(&directory)["toolBridge"].clone();
+    seed_pending_receipt_limit_retry(&directory);
 
     let mut recovered = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
-    let resumed = wait_for_executor_event(&mut recovered, "session.resumed");
-    assert_eq!(resumed.payload["provider"], "codex");
-    let diagnostic = wait_for_executor_event(&mut recovered, "harness.diagnostic");
-    assert_eq!(
-        diagnostic.payload["code"],
-        "semantic_tool_turn_receipt_limit"
-    );
+    let mut emitted = wait_for_executor_event_batch(&mut recovered, "session.resumed");
+    assert!(emitted.iter().any(|event| {
+        event.event_type == "session.resumed" && event.payload["provider"] == "codex"
+    }));
+    assert_eq!(call_count(&directory, "tool-response:failure"), 1);
     assert_eq!(call_count(&directory, "turn/interrupt"), 1);
+    let pending = read_receipt_limit_state(&directory);
+    assert_at_capacity_receipts_preserved_by_stop(&pending["toolBridge"], &saturated_bridge);
+    assert_eq!(pending["receiptLimitInterruptPending"], true);
+    assert_eq!(pending["receiptLimitInterruptAccepted"], false);
+    assert_eq!(pending["receiptLimitInterruptAttempts"], 1);
+    assert_eq!(
+        pending["receiptLimitInterruptDeadlineUnixMs"],
+        json!(u64::MAX)
+    );
 
     // Lose the live transport while retaining its durable interruption retry,
     // then model the provider settling the turn before runnerd reconnects.
@@ -5002,9 +5314,11 @@ fn receipt_limit_retry_preserves_a_turn_settled_during_provider_recovery() {
     )
     .expect("settle the fake provider turn before recovery");
 
-    let events = poll_and_ack(&mut recovered)
-        .expect("an already-settled retry must preserve the recovered terminal state");
-    assert!(events.iter().any(|event| {
+    emitted.extend(
+        poll_and_ack(&mut recovered)
+            .expect("an already-settled retry must preserve the recovered terminal state"),
+    );
+    assert!(emitted.iter().any(|event| {
         event.event_type == "session.reconciled" && event.payload["activeProviderTurnId"].is_null()
     }));
     assert_eq!(
@@ -5025,6 +5339,111 @@ fn receipt_limit_retry_preserves_a_turn_settled_during_provider_recovery() {
     assert!(persisted["receiptLimitInterruptDeadlineUnixMs"].is_null());
 
     recovered.shutdown().expect("stop recovered provider");
+    fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
+}
+
+#[test]
+fn receipt_limit_recovers_at_capacity_pending_stop_after_expired_unaccepted_checkpoint() {
+    let _receipt_limit_test = lock_receipt_limit_test();
+    let directory = temporary_directory("receipt-limit-expired-unaccepted");
+    let config = provider_config(
+        &directory,
+        &[
+            "--require-dynamic-tool",
+            "--hold-turn",
+            "--emit-tool-call-on-resume",
+            "--fail-first-interrupt",
+        ],
+    );
+    let runner_config = durable_config(&directory);
+    let mut first = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+    first
+        .execute(&command(
+            "prepare",
+            1,
+            "run.prepare",
+            json!({
+                "provider": config, "authorizedTools": task_context_tool_set(),
+            }),
+        ))
+        .expect("prepare Codex provider");
+    first
+        .execute(&command("open", 2, "session.open", json!({})))
+        .expect("open Codex session");
+    first
+        .execute(&command(
+            "turn",
+            3,
+            "turn.start",
+            json!({"text": "Recover an at-capacity pending stop, then expire its unaccepted interruption."}),
+        ))
+        .expect("start held provider turn");
+    drop(first);
+    saturate_provider_tool_receipts(&directory);
+    let saturated_bridge = read_receipt_limit_state(&directory)["toolBridge"].clone();
+    seed_pending_receipt_limit_retry(&directory);
+
+    let mut recovered = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+    let mut emitted = wait_for_executor_event_batch(&mut recovered, "session.resumed");
+    assert_eq!(call_count(&directory, "tool-response:failure"), 1);
+    assert_eq!(call_count(&directory, "turn/interrupt"), 1);
+    let pending = read_receipt_limit_state(&directory);
+    assert_at_capacity_receipts_preserved_by_stop(&pending["toolBridge"], &saturated_bridge);
+    assert_eq!(pending["receiptLimitInterruptPending"], true);
+    assert_eq!(pending["receiptLimitInterruptAccepted"], false);
+    assert_eq!(pending["receiptLimitInterruptAttempts"], 1);
+    assert_eq!(
+        pending["receiptLimitInterruptDeadlineUnixMs"],
+        json!(u64::MAX)
+    );
+    recovered
+        .shutdown()
+        .expect("stop the transport before explicitly expiring its deadline");
+    drop(recovered);
+    let before_edit = read_receipt_limit_state(&directory);
+    assert!(
+        before_edit == pending,
+        "shutdown must preserve the pending checkpoint"
+    );
+    let mut expired = before_edit.clone();
+    expired["receiptLimitInterruptDeadlineUnixMs"] = json!(1);
+    let mut reverse = expired.clone();
+    reverse["receiptLimitInterruptDeadlineUnixMs"] =
+        before_edit["receiptLimitInterruptDeadlineUnixMs"].clone();
+    assert!(
+        reverse == before_edit,
+        "expiry must change only the existing deadline field"
+    );
+    fs::write(
+        directory.join("codex-provider-state.json"),
+        serde_json::to_vec_pretty(&expired).unwrap(),
+    )
+    .expect("write explicitly expired unaccepted checkpoint");
+
+    let mut recovered = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+    emitted.extend(wait_for_executor_event_batch(&mut recovered, "turn.failed"));
+    let failed = emitted
+        .iter()
+        .find(|event| event.event_type == "turn.failed")
+        .expect("the expired unaccepted stop must fail conservatively");
+    assert_eq!(
+        failed.payload["code"],
+        "semantic_tool_turn_receipt_limit_interrupt_unconfirmed"
+    );
+    assert_eq!(failed.payload["interruptAccepted"], false);
+    assert_eq!(failed.payload["providerTerminalObserved"], false);
+    assert!(!emitted
+        .iter()
+        .any(|event| event.event_type == "turn.interrupted"));
+    assert_eq!(call_count(&directory, "turn/interrupt"), 1);
+    let settled = read_receipt_limit_state(&directory);
+    assert_eq!(settled["lifecycle"], "closed");
+    assert!(settled["activeProviderTurnId"].is_null());
+    assert_eq!(settled["receiptLimitInterruptPending"], false);
+    assert_eq!(settled["receiptLimitInterruptAccepted"], false);
+    assert_eq!(settled["receiptLimitInterruptAttempts"], 0);
+    assert!(settled["receiptLimitInterruptDeadlineUnixMs"].is_null());
+    recovered.shutdown().expect("stop closed provider");
     fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
 }
 
@@ -5429,11 +5848,20 @@ fn receipt_limit_synthesizes_interrupted_after_an_accepted_terminal_deadline() {
             .expect("read bounded receipt-limit state"),
     )
     .expect("parse bounded receipt-limit state");
-    assert_eq!(persisted["lifecycle"], "provider_exited");
+    assert_eq!(persisted["lifecycle"], "closed");
     assert!(persisted["activeProviderTurnId"].is_null());
     assert_eq!(persisted["receiptLimitInterruptPending"], false);
     assert_eq!(persisted["receiptLimitInterruptAttempts"], 0);
     assert!(persisted["receiptLimitInterruptDeadlineUnixMs"].is_null());
+
+    let resume_calls = call_count(&directory, "thread/resume");
+    poll_and_ack(&mut recovered).expect("closed fallback stays pollable");
+    let mut reconnected = CodexCommandExecutor::with_runner_config(&directory, &runner_config);
+    poll_and_ack(&mut reconnected).expect("closed fallback stays pollable after reconnect");
+    assert_eq!(call_count(&directory, "thread/resume"), resume_calls);
+    reconnected
+        .shutdown()
+        .expect("closed reconnect has no provider to stop");
 
     recovered
         .shutdown()
@@ -6223,6 +6651,34 @@ fn skill_wire_requests(directory: &Path) -> Vec<Value> {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect()
+}
+
+#[test]
+fn runtime_instructions_are_additive_for_codex_on_start_and_resume() {
+    let directory = temporary_directory("instruction-channel-wire");
+    let log = directory.join("requests.ndjson");
+    let config = provider_config(&directory, &["--request-log", log.to_str().unwrap()]);
+    let mut provider = CodexProvider::start(&config, None).unwrap();
+    let thread_id = provider.thread_id().to_owned();
+    provider.shutdown().unwrap();
+    let mut resumed = CodexProvider::start(&config, Some(&thread_id)).unwrap();
+    resumed.shutdown().unwrap();
+    let frames = skill_wire_requests(&directory);
+    for method in ["thread/start", "thread/resume"] {
+        let frame = frames
+            .iter()
+            .find(|frame| frame["method"] == method)
+            .unwrap();
+        assert_eq!(
+            frame["params"]["developerInstructions"], config.instructions,
+            "{method}"
+        );
+        assert!(
+            frame["params"].get("baseInstructions").is_none(),
+            "{method}"
+        );
+    }
+    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]

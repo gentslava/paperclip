@@ -2,11 +2,14 @@ import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
+  costEvents,
   activityLog,
   agents,
+  authUsers,
   agentRuntimeState,
   agentWakeupRequests,
   companies,
+  companyMemberships,
   companySkills,
   createDb,
   heartbeatRunEvents,
@@ -36,6 +39,8 @@ describeEmbeddedPostgres("heartbeat task-drain admission release", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("heartbeat-task-drain-admission-release-");
     db = createDb(tempDb.connectionString);
+    await db.insert(authUsers).values({ id: "responsible-user", name: "Drain fixture sponsor",
+      email: "drain-sponsor@example.test", createdAt: new Date(), updatedAt: new Date() });
   }, 60_000);
 
   function isHeartbeatRunDependentFkError(error: unknown) {
@@ -51,6 +56,7 @@ describeEmbeddedPostgres("heartbeat task-drain admission release", () => {
       await db.delete(heartbeatRunEvents);
       await db.delete(activityLog);
       try {
+        await db.delete(costEvents);
         await db.delete(heartbeatRuns);
         return;
       } catch (error) {
@@ -68,6 +74,7 @@ describeEmbeddedPostgres("heartbeat task-drain admission release", () => {
     await db.delete(agentRuntimeState);
     await db.delete(agents);
     await db.delete(companySkills);
+    await db.delete(companyMemberships);
     await db.delete(companies);
   });
 
@@ -86,6 +93,8 @@ describeEmbeddedPostgres("heartbeat task-drain admission release", () => {
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
     });
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "responsible-user",
+      membershipRole: "operator", status: "active" });
 
     await db.insert(agents).values({
       id: agentId,

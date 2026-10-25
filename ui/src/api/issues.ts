@@ -1,3 +1,6 @@
+import type { SetIssueTitle } from "@paperclipai/shared";
+import { ISSUE_SUMMARIES_MAX_IDS } from "@paperclipai/shared";
+import type { IssueSummary } from "@paperclipai/shared";
 import type { ExecutionReconciliation } from "@paperclipai/shared";
 import type {
   AcceptedPlanDecompositionSummary,
@@ -10,6 +13,10 @@ import type {
   FeedbackTrace,
   FeedbackVote,
   Issue,
+  IssueAccessGrant,
+  IssueAccessGrantSubjectType,
+  IssueVisibility,
+  IssuePrivacyConstraints,
   IssueChanges,
   IssueAttachment,
   IssueCostSummary,
@@ -35,7 +42,7 @@ import type {
   UpsertIssueWatchdog,
   UpsertIssueDocument,
 } from "@paperclipai/shared";
-import { api, ApiError, type RequestOptions } from "./client";
+import { api, ApiError, detachInflightGet, type RequestOptions } from "./client";
 import { CommentSubmissionUnknownError } from "../lib/comment-submit-result";
 
 function hasCommentReceipt(value: unknown): boolean {
@@ -97,6 +104,8 @@ export type IssueListFilters = {
   originId?: string;
   descendantOf?: string;
   createdFromIssueId?: string;
+  includeAgentCreatedTasks?: boolean;
+  includeParticipatedTasks?: boolean;
   includeRoutineExecutions?: boolean;
   includeBlockedBy?: boolean;
   includeBlockedInboxAttention?: boolean;
@@ -138,6 +147,9 @@ function issueListSearchParams(filters?: IssueListFilters) {
   if (filters?.originId) params.set("originId", filters.originId);
   if (filters?.descendantOf) params.set("descendantOf", filters.descendantOf);
   if (filters?.createdFromIssueId) params.set("createdFromIssueId", filters.createdFromIssueId);
+  if (filters?.includeParticipatedTasks) params.set("includeParticipatedTasks", "true");
+  if (filters?.includeAgentCreatedTasks !== undefined)
+    params.set("includeAgentCreatedTasks", String(filters.includeAgentCreatedTasks));
   if (filters?.includeRoutineExecutions)
     params.set("includeRoutineExecutions", "true");
   if (filters?.includeBlockedBy) params.set("includeBlockedBy", "true");
@@ -159,6 +171,17 @@ function issueListSearchParams(filters?: IssueListFilters) {
 }
 
 export const issuesApi = {
+  summaries: async (companyId: string, issueIds: readonly string[], options?: RequestOptions): Promise<IssueSummary[]> => {
+    if (issueIds.length > ISSUE_SUMMARIES_MAX_IDS) throw new Error("Too many issue summary IDs");
+    const ids = [...new Set(issueIds.map((id) => id.trim().toLowerCase()))].sort();
+    if (ids.length === 0) return [];
+    const params = new URLSearchParams({ ids: ids.join(",") });
+    const path = `/companies/${companyId}/issues/summaries?${params}`;
+    // React Query deduplicates within an account; URL-only HTTP coalescing must
+    // never join a request sent with the previous account's cookie.
+    detachInflightGet(path);
+    return api.get<IssueSummary[]>(path, { ...options, cache: "no-store" });
+  },
   /** Fetch every page for bounded task-detail relations, not just the default first page. */
   listAll: async (companyId: string, filters: Omit<IssueListFilters, "limit" | "offset" | "sortField" | "sortDir" | "afterId" | "attention">, options?: RequestOptions): Promise<Issue[]> => {
     const pageSize = 500;
@@ -256,6 +279,8 @@ export const issuesApi = {
     api.delete<{ id: string; archivedAt: Date } | { ok: true }>(
       `/issues/${id}/inbox-archive`,
     ),
+  setTitle: (id: string, data: SetIssueTitle) =>
+    api.put<{ id: string; title: string; titleNeedsGeneration: boolean; changed: boolean }>(`/issues/${id}/title`, data),
   create: (companyId: string, data: Record<string, unknown>) =>
     api.post<Issue>(`/companies/${companyId}/issues`, data),
   update: (id: string, data: Record<string, unknown>) => {
@@ -271,13 +296,27 @@ export const issuesApi = {
       `/issues/${id}/stalled-review-decision`,
       data,
     ),
+  resumeWorkspaceFinalization: (id: string, data: { actionId: string; runId: string; ownerToken: string; controllerAndCopybackStopped: true; stopEvidence: string }) =>
+    api.post<{ runId: string; resultId: string; status: "queued" }>(`/issues/${id}/recovery-actions/resume-workspace-finalization`, data),
+  retryWorkspaceExport: (id: string, data: { actionId: string; runId: string; repairNote: string }) =>
+    api.post<{ runId: string; resultId: string; leaseId: string; status: "queued" }>(`/issues/${id}/recovery-actions/retry-workspace-export`, data),
+  retryTask: (issueId: string, body: { idempotencyKey: string; observedRunId: string | null }) =>
+    api.post<{ requestId: string | null; accepted: boolean; stale: boolean; presentation: import("@paperclipai/shared").TaskInterruptionPresentation | null }>(`/issues/${issueId}/retry`, body),
+  recoverWorkspace: (id: string, data: { actionId: string; runId: string; idempotencyKey: string }) =>
+    api.post<{ actionId: string; status: string }>(`/issues/${id}/recovery-actions/recover-workspace`, data),
+  reconstructWorkspace: (id: string, data: { actionId: string; runId: string; expectedStatusVersion: number; attachmentIds: string[];
+    missingWork: string; actionOutcome: "completed" | "not_performed" | "mixed"; outcomeEvidence: string; acknowledgeLostWork: true }) =>
+    api.post<{ runId: string; actionId: string; status: "queued"; replayed: boolean }>(`/issues/${id}/recovery-actions/reconstruct-workspace`, data),
+  recoveryActions: (id: string) =>
+    api.get<{ active: IssueRecoveryAction | null; actions: IssueRecoveryAction[] }>(`/issues/${id}/recovery-actions`),
   resolveRecoveryAction: (
     id: string,
     data: {
       executionReconciliation?: ExecutionReconciliation;
+      workspaceBaseRef?: { requestedRef: string; branch: string };
       actionId?: string;
       outcome: "restored" | "false_positive" | "blocked" | "cancelled";
-      sourceIssueStatus: "todo" | "done" | "in_review" | "blocked";
+      sourceIssueStatus: Issue["status"];
       resolutionNote?: string | null;
     },
   ) =>
@@ -451,6 +490,8 @@ export const issuesApi = {
       `/issues/${id}/interactions/${interactionId}/skip`,
       reason ? { reason } : {},
     ),
+  dismissInteraction: (id: string, interactionId: string) =>
+    api.post<IssueThreadInteraction>(`/issues/${id}/interactions/${interactionId}/dismiss`, {}),
   respondToInteraction: (
     id: string,
     interactionId: string,
@@ -584,17 +625,35 @@ export const issuesApi = {
       form,
     );
   },
-  deleteAttachment: (id: string) =>
-    api.delete<{ ok: true }>(`/attachments/${id}`),
+  deleteAttachment: (id: string) => api.delete<{ ok: true }>(`/attachments/${id}`),
+  // --- Privacy / sharing (PAP-16066) -------------------------------------
+  // Enriched grants for the share sheet: implicit-by-source rows (assignment /
+  // project) plus explicit grants, each carrying subjectDisplayName / avatar /
+  // agentVisibility from the server enrichment pass.
+  privacyConstraints: (id: string) => api.get<IssuePrivacyConstraints>(`/issues/${id}/privacy-constraints`),
+  listAccessGrants: (id: string, options?: RequestOptions) =>
+    options
+      ? api.get<IssueAccessGrant[]>(`/issues/${id}/access-grants`, options)
+      : api.get<IssueAccessGrant[]>(`/issues/${id}/access-grants`),
+  createAccessGrant: (
+    id: string,
+    data: { subjectType: IssueAccessGrantSubjectType; subjectId: string },
+  ) => api.post<IssueAccessGrant>(`/issues/${id}/access-grants`, data),
+  revokeAccessGrant: (id: string, grantId: string) =>
+    api.post<IssueAccessGrant>(`/issues/${id}/access-grants/${grantId}/revoke`, {}),
+  setVisibility: (id: string, visibility: IssueVisibility) =>
+    api.patch<IssueUpdateResponse>(`/issues/${id}`, { visibility }),
   listApprovals: (id: string) => api.get<Approval[]>(`/issues/${id}/approvals`),
   linkApproval: (id: string, approvalId: string) =>
     api.post<Approval[]>(`/issues/${id}/approvals`, { approvalId }),
   unlinkApproval: (id: string, approvalId: string) =>
     api.delete<{ ok: true }>(`/issues/${id}/approvals/${approvalId}`),
-  listWorkProducts: (id: string, options?: { refreshPullRequests?: boolean }) =>
-    api.get<IssueWorkProduct[]>(
-      `/issues/${id}/work-products${options?.refreshPullRequests ? "?refreshPullRequests=true" : ""}`,
-    ),
+  listWorkProducts: (id: string, options?: { refreshPullRequests?: boolean; signal?: AbortSignal; fresh?: boolean }) => {
+    const path = `/issues/${id}/work-products${options?.refreshPullRequests ? "?refreshPullRequests=true" : ""}`;
+    // Query invalidations must not rejoin a request that read rows before the write.
+    if (options?.fresh) detachInflightGet(path);
+    return api.get<IssueWorkProduct[]>(path, { signal: options?.signal });
+  },
   ensureWorkProductReviewDocument: (id: string, workProductId: string) =>
     api.post<IssueDocument>(
       `/issues/${id}/work-products/${workProductId}/review-document`,
