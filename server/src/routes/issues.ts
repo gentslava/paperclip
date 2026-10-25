@@ -7954,6 +7954,29 @@ export function issueRoutes(
     return rawId;
   }
 
+  async function resolveIssueIdListFilters(
+    req: Request,
+    res: Response,
+  ): Promise<Record<string, unknown> | null> {
+    const query: Record<string, unknown> = { ...req.query };
+    for (const paramName of ["parentId", "parentIssueId", "descendantOf"] as const) {
+      const raw = query[paramName];
+      if (typeof raw !== "string") continue;
+      const identifier = normalizeIssueReferenceIdentifier(raw.trim());
+      if (!identifier) continue;
+      const issue = await svc.getByIdentifier(identifier);
+      if (!issue) {
+        res.status(404).json({
+          error: paramName === "descendantOf" ? "descendant_not_found" : "parent_not_found",
+          identifier,
+        });
+        return null;
+      }
+      query[paramName] = issue.id;
+    }
+    return query;
+  }
+
   async function resolveIssueProjectAndGoal(issue: {
     companyId: string;
     projectId: string | null;
@@ -8482,7 +8505,9 @@ export function issueRoutes(
       });
       return;
     }
-    const uuidQuery = parseIssueListUuidQueryParams(req.query);
+    const issueIdFilters = await resolveIssueIdListFilters(req, res);
+    if (!issueIdFilters) return;
+    const uuidQuery = parseIssueListUuidQueryParams(issueIdFilters);
     if (!uuidQuery.ok) {
       res.status(422).json({ error: uuidQuery.error });
       return;
@@ -8727,7 +8752,9 @@ export function issueRoutes(
       return;
     }
 
-    const countUuidQuery = parseIssueListUuidQueryParams(req.query);
+    const issueIdFilters = await resolveIssueIdListFilters(req, res);
+    if (!issueIdFilters) return;
+    const countUuidQuery = parseIssueListUuidQueryParams(issueIdFilters);
     if (!countUuidQuery.ok) {
       res.status(422).json({ error: countUuidQuery.error });
       return;
