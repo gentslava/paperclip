@@ -5578,8 +5578,13 @@ export function agentRoutes(
         adapterConfig: patchData.adapterConfig,
       });
     }
+    const unbindingAiConnection = requestedRuntimeConfig?.aiConnection === null;
+    if (requestedRuntimeConfig?.aiConnection === null) {
+      if (Object.keys(requestedRuntimeConfig).length === 1) requestedRuntimeConfig = { ...existing.runtimeConfig };
+      delete requestedRuntimeConfig.aiConnection;
+    }
     const nextAiConfig = (patchData.adapterConfig ?? existing.adapterConfig) as Record<string, unknown>;
-    if (existing.runtimeConfig.aiConnection && requestedRuntimeConfig && !requestedRuntimeConfig.aiConnection
+    if (!unbindingAiConnection && existing.runtimeConfig.aiConnection && requestedRuntimeConfig && !requestedRuntimeConfig.aiConnection
       && !(existing.lifecycleState === "paused" && existing.pauseReason === "setup")) {
       const existingBinding = aiRuntimeConnectionBindingSchema.safeParse(existing.runtimeConfig.aiConnection).data;
       if (existingBinding && agentHarnessType(existing.adapterType, existing.adapterConfig) === agentHarnessType(requestedAdapterType, nextAiConfig)
@@ -5588,7 +5593,7 @@ export function agentRoutes(
         requestedRuntimeConfig.aiConnection = existingBinding;
       }
     }
-    if (!requestedRuntimeConfig?.aiConnection && !existing.runtimeConfig.aiConnection
+    if (!unbindingAiConnection && !requestedRuntimeConfig?.aiConnection && !existing.runtimeConfig.aiConnection
       && !(existing.lifecycleState === "paused" && existing.pauseReason === "setup")
       && requestedAdapterType === "paperclip_runner" && nextAiConfig.provider === "acpx"
       && nextAiConfig.acpxAgent === "copilot"
@@ -5599,12 +5604,14 @@ export function agentRoutes(
     const nextAiBinding = aiRuntimeConnectionBindingSchema.safeParse(requestedRuntimeConfig ? requestedRuntimeConfig.aiConnection : existing.runtimeConfig.aiConnection).data;
     if (nextAiBinding) {
       await assertCanConfigureAgentSetup(req, existing);
-      const changed = JSON.stringify(nextAiBinding) !== JSON.stringify(existing.runtimeConfig.aiConnection);
+      // Stored bindings come back from jsonb with reordered keys, so compare parsed values.
+      const changed = JSON.stringify(nextAiBinding) !== JSON.stringify(aiRuntimeConnectionBindingSchema.safeParse(existing.runtimeConfig.aiConnection).data);
       const aiConfig = (patchData.adapterConfig ?? existing.adapterConfig) as Record<string, unknown>;
       if (nextAiBinding.mode !== "router" && !isAiConnectionCompatible(nextAiBinding, requestedAdapterType, aiConfig.model, aiConfig.provider, aiConfig.acpxAgent)) throw unprocessable("Select an AI connection compatible with the new harness and model");
       const copilotConfigurationChanged = requestedAdapterType === "paperclip_runner" && aiConfig.provider === "acpx" && aiConfig.acpxAgent === "copilot"
         && (touchesAdapterConfiguration || Object.prototype.hasOwnProperty.call(patchData, "defaultEnvironmentId"));
-      if (runtimeSettings || changed || copilotConfigurationChanged || (nextAiBinding.mode === "router" && requestedAdapterType !== existing.adapterType)) {
+      const recheckUnchanged = nextAiBinding.mode === "router" ? requestedAdapterType !== existing.adapterType : touchesAdapterConfiguration;
+      if (runtimeSettings || changed || copilotConfigurationChanged || recheckUnchanged) {
         const configuringSetup = existing.lifecycleState === "paused" && existing.pauseReason === "setup";
         await validateManagedAgentBinding(req, existing.companyId, existing.id, requestedAdapterType, aiConfig, nextAiBinding,
           (patchData.defaultEnvironmentId !== undefined ? patchData.defaultEnvironmentId : existing.defaultEnvironmentId) as string | null,
