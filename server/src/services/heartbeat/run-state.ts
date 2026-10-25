@@ -1170,8 +1170,8 @@ export function createHeartbeatRunState(db: Db) {
       .then((rows) => rows[0] ?? null);
   }
 
-  async function getRuntimeState(agentId: string) {
-    return db
+  async function getRuntimeState(agentId: string, executor: Db = db) {
+    return executor
       .select()
       .from(agentRuntimeState)
       .where(eq(agentRuntimeState.agentId, agentId))
@@ -1208,8 +1208,9 @@ export function createHeartbeatRunState(db: Db) {
     agentId: string,
     adapterType: string,
     taskKey: string,
+    executor: Db = db,
   ) {
-    return db
+    return executor
       .select()
       .from(agentTaskSessions)
       .where(
@@ -1442,6 +1443,7 @@ export function createHeartbeatRunState(db: Db) {
   async function resolveSessionBeforeForWakeup(
     agent: typeof agents.$inferSelect,
     taskKey: string | null,
+    executor: Db = db,
   ) {
     if (taskKey) {
       const codec = getAdapterSessionCodec(agent.adapterType);
@@ -1450,6 +1452,7 @@ export function createHeartbeatRunState(db: Db) {
         agent.id,
         agent.adapterType,
         taskKey,
+        executor,
       );
       const parsedParams = normalizeSessionParams(
         codec.deserialize(existingTaskSession?.sessionParamsJson ?? null),
@@ -1461,7 +1464,7 @@ export function createHeartbeatRunState(db: Db) {
       );
     }
 
-    const runtimeForRun = await getRuntimeState(agent.id);
+    const runtimeForRun = await getRuntimeState(agent.id, executor);
     return runtimeForRun?.sessionId ?? null;
   }
 
@@ -1483,6 +1486,7 @@ export function createHeartbeatRunState(db: Db) {
     explicitResumeSession: Awaited<
       ReturnType<typeof resolveExplicitResumeSessionOverride>
     > | null;
+    executor?: Db;
   }) {
     if (
       await hasResolvableSessionWorkspaceCwd(
@@ -1499,6 +1503,7 @@ export function createHeartbeatRunState(db: Db) {
       input.agent.id,
       input.agent.adapterType,
       input.taskKey,
+      input.executor,
     );
     const taskSessionParams = normalizeResumeParamsForAdapter(
       input.agent.adapterType,
