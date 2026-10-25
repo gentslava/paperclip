@@ -2,15 +2,15 @@
 # One number per line; text after "#" is a comment. Merged/closed PRs are skipped automatically.
 13726@rebase/13726-claude-credential-refresh  # fix(ai-connections): rotate Claude subscription credentials from a file (Claude login refresh); our rebase onto master, upstream PR conflicts since #14967/#14970/#14994
 14027@rebase/14027-bound-agent-edit  # fix(agents): let bound agents be edited and unbound from AI connections; our rebase onto master
-10862  # Make agent role editable after creation
-14147  # fix(claude-local): show the ANTHROPIC_MODEL default in the model picker (ours)
-14224  # fix(ai-connections): reactivate an archived provider application on connect (ours)
-14257  # fix(heartbeat): keep wakeup reads on their transaction connection (pool deadlock, #14196/#14197)
-15534  # feat(codex-local): list the ChatGPT subscription's Codex catalog in the model picker (ours)
-15539  # feat(auth): add invite-only sign-up mode (ours)
+10862@rebase/10862-agent-role  # Make agent role editable after creation; preserve the current upstream form test harness
+14147@rebase/14147-claude-default-model  # fix(claude-local): show the ANTHROPIC_MODEL default in the model picker; current upstream model and form tests
+14224@rebase/14224-ai-provider-reactivation  # fix(ai-connections): reactivate an archived provider application on connect; preserve upstream connection-removal extraction
+14257@rebase/14257-wakeup-transaction  # fix(heartbeat): keep wakeup reads on their transaction connection; ported through upstream heartbeat modules
+15534@rebase/15534-codex-catalog  # feat(codex-local): list the ChatGPT subscription's Codex catalog in the model picker; preserve current upstream route imports
+15539@rebase/15539-invite-story-catalog  # feat(auth): add invite-only sign-up mode; register stories with the current feature catalog
 # Community fixes (reviewed, tests green on top of the list above)
 13647  # fix(claude-local): stop scanning the raw transcript for login prompts
-14089  # fix(claude-local): gate claude_auth_required on a failed run
+14089@rebase/14089-auth-test-compat  # fix(claude-local): gate claude_auth_required on a failed run; model upstream CLI version checks in fixtures
 13885  # fix(claude-local): stop sealing max-turns failures as model_not_found
 14039@rebase/14039-claude-thinking-effort-per-model  # fix(claude-local): map thinking effort to the selected model; our rebase onto master
 13566  # fix(server): restore top-level redacted adapter secrets on agent update
@@ -18,5 +18,5 @@
 12842@rebase/12842-runtimeconfig-patch-merge  # fix(agents): merge runtimeConfig on PATCH instead of replacing the column; our rebase onto master
 12870  # fix(adapter-utils): strip DATABASE_URL and BETTER_AUTH_SECRET from inherited agent env
 13833@rebase/13833-run-context-checked-out-issue  # fix(server): bind run context to the checked-out issue; our rebase onto master
-7432   # fix(issues): resolve identifier to UUID for parentId/descendantOf filters
+7432@rebase/7432-issue-identifiers  # fix(issues): resolve identifier to UUID for parentId/descendantOf filters; preserve upstream UUID validation
 12117  # fix(skill): teach agents that PAPERCLIP_API_URL excludes the /api prefix
