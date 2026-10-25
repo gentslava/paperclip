@@ -117,7 +117,7 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
     expect(recorded.filter((row) => row.action === "issue.cross_issue_influence_cap_rejected")).toHaveLength(1);
   });
 
-  it("binds a taskless run at checkout so same-issue writes pass the gate", async () => {
+  it("charges taskless writes before checkout and exempts later same-issue writes", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const runId = randomUUID();
@@ -150,14 +150,14 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
       contextSnapshot: { source: "timer" },
     });
 
-    // Before the bind, even a same-issue write is rejected for missing context.
+    // Unscoped writes spend the normal influence budget before checkout.
     await expect(observeCrossIssueInfluence(db, {
       companyId,
       runId,
       agentId,
       targetIssueId: checkedOutIssueId,
       kind: "comment",
-    })).rejects.toMatchObject({ status: 403 });
+    })).resolves.toMatchObject({ allowed: true, count: 1 });
 
     expect(await bindRunContextToCheckedOutIssue(db, {
       companyId,
@@ -195,7 +195,7 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
       agentId,
       targetIssueId: otherIssueId,
       kind: "comment",
-    })).resolves.toMatchObject({ allowed: true, count: 1 });
+    })).resolves.toMatchObject({ allowed: true, count: 2 });
   });
 
   it("binds once: an existing source issue or task wins and null snapshots are supported", async () => {

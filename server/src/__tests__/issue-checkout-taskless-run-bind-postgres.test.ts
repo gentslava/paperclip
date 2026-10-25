@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -34,13 +34,8 @@ if (!embeddedPostgresSupport.supported) {
 
 /**
  * Route-level proof for the taskless checkout bind: a timer-woken heartbeat run
- * with no task context (no `issueId`/`taskId` in its persisted `contextSnapshot`) is read-only
- * for every issue write until it checks out an issue. `POST /api/issues/:id/checkout`
- * must anchor the run to the claimed issue, after which same-issue comments and
- * status updates pass the cross-issue influence gate. This ties the real routes,
- * the real checkout bind, the real gate, and a real database together end to end —
- * the piecewise unit tests prove each half, this proves the whole path a taskless
- * run actually takes (checkout → write disposition).
+ * with no issue/task context spends the cross-issue budget until checkout anchors
+ * the run. Later same-issue comments and status updates are exempt from that cap.
  */
 describeEmbeddedPostgres(
   "taskless checkout binds run context so same-issue writes pass the gate (routes + postgres)",
@@ -156,13 +151,11 @@ describeEmbeddedPostgres(
       const runId = await seedTasklessRun(companyId, agentId);
       const client = app(agentActor(companyId, agentId, runId));
 
-      // Before checkout there is no source issue/task on the run: even a write to
-      // the issue the run is assigned fails closed with the run-context denial.
+      // Assignment alone does not exempt an unscoped run from the cap.
       const before = await request(client)
         .post(`/api/issues/${issueId}/comments`)
         .send({ body: "before checkout" });
-      expect(before.status, JSON.stringify(before.body)).toBe(403);
-      expect(before.body.details?.code).toBe("cross_issue_influence_run_context_required");
+      expect(before.status, JSON.stringify(before.body)).toBe(201);
 
       // Checkout anchors the run to the claimed issue.
       const checkout = await request(client)
@@ -190,6 +183,16 @@ describeEmbeddedPostgres(
         .send({ status: "blocked", blockedByIssueIds: [blockerId] });
       expect(update.status, JSON.stringify(update.body)).toBe(200);
       expect(update.body.status).toBe("blocked");
+
+      const influence = await db
+        .select({ entityId: activityLog.entityId })
+        .from(activityLog)
+        .where(and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.runId, runId),
+          eq(activityLog.action, "issue.cross_issue_influence_observed"),
+        ));
+      expect(influence).toEqual([{ entityId: issueId }]);
     }, 30_000);
 
     it("binds once: a task-context run keeps its own source when it checks out another issue", async () => {
