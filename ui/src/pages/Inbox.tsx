@@ -1,7 +1,7 @@
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useNavigate } from "@/lib/router";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { deriveOriginatingActor, INBOX_MINE_ISSUE_STATUS_FILTER } from "@paperclipai/shared";
+import { deriveOriginatingActor, INBOX_MINE_ISSUE_STATUS_FILTER, isHeartbeatRunVisibleInMine } from "@paperclipai/shared";
 import { usePublishSharedQueryData, useSharedPollingQuery } from "@/hooks/useSharedPolling";
 import { approvalsApi } from "../api/approvals";
 import { accessApi } from "../api/access";
@@ -10,6 +10,7 @@ import { ApiError } from "../api/client";
 import { dashboardApi } from "../api/dashboard";
 import { executionWorkspacesApi } from "../api/execution-workspaces";
 import { issuesApi } from "../api/issues";
+import { useSecondTick } from "../hooks/useSecondTick";
 import { agentsApi } from "../api/agents";
 import { heartbeatsApi } from "../api/heartbeats";
 import { instanceSettingsApi } from "../api/instanceSettings";
@@ -23,7 +24,6 @@ import {
 import { useCompany } from "../context/CompanyContext";
 import { useToastActions } from "../context/ToastContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
-import { useGeneralSettings } from "../context/GeneralSettingsContext";
 import { useSidebar } from "../context/SidebarContext";
 import { queryKeys } from "../lib/queryKeys";
 import { useDialogActions } from "../context/DialogContext";
@@ -222,7 +222,13 @@ function normalizeInboxCollectionViewState(value: unknown): StreamlinedInboxView
         ? category
         : "everything",
     allApprovalFilter: approval === "actionable" || approval === "resolved" ? approval : "all",
-    issueFilters: normalizeIssueFilterState(candidate.issueFilters),
+    issueFilters: {
+      ...normalizeIssueFilterState(candidate.issueFilters),
+      // The filter menu no longer offers Workspace. Drop a saved selection so
+      // it cannot keep hiding tasks. A task-link workspace query is applied
+      // by the task list after this load.
+      workspaces: [],
+    },
     showDateGroupSeparators: candidate.showDateGroupSeparators !== false,
   };
 }
@@ -293,6 +299,7 @@ function approvalStatusLabel(status: Approval["status"]): string {
 }
 
 function readIssueIdFromRun(run: HeartbeatRun): string | null {
+  if (run.issueId) return run.issueId;
   const context = run.contextSnapshot;
   if (!context) return null;
 
@@ -378,7 +385,18 @@ export function FailedRunInboxRow({
 }) {
   const issueId = readIssueIdFromRun(run);
   const issue = issueId ? issueById.get(issueId) ?? null : null;
-  const displayError = runFailureMessage(run);
+  const interruption = issue?.interruption;
+  useSecondTick(interruption?.state === "retry_scheduled");
+  const retrySeconds = Math.max(0, Math.ceil((Date.parse(interruption?.nextRetryAt ?? "") - Date.now()) / 1000));
+  const displayError = isRetrying || interruption?.state === "working" ? "Thinking"
+    : interruption?.state === "retry_scheduled" ? `Trying again in ${retrySeconds}s…`
+      : interruption?.state === "failed" ? "Couldn’t finish this attempt. Your message is saved."
+        : interruption?.state === "waiting_for_user" ? ({
+          approval: "Approval required", reconnect: "Reconnect account", assign_agent: "Assign an agent", choose_model: "Choose a supported model",
+          resume: "Work is paused", budget: "Budget limit reached",
+          project_access: "Agent needs project access",
+        }[interruption.userAction ?? "resume"]) : runFailureMessage(run);
+  const retryAvailable = !interruption || interruption.canRetry;
   const showUnreadSlot = unreadState !== null;
   const showUnreadDot = unreadState === "visible" || unreadState === "fading";
 
@@ -412,7 +430,7 @@ export function FailedRunInboxRow({
           </span>
         ) : null}
         <Link
-          to={`/agents/${run.agentId}/runs/${run.id}`}
+          to={issueId ? `/issues/${issueId}` : `/agents/${run.agentId}/runs/${run.id}`}
           className={cn(
             "flex min-w-0 flex-1 items-start gap-2 no-underline text-inherit transition-colors",
             selected ? "hover:bg-transparent" : "hover:bg-accent/50",
@@ -437,7 +455,7 @@ export function FailedRunInboxRow({
               )}
             </span>
             <span className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
-              <StatusBadge status={run.status} />
+              {!interruption && <StatusBadge status={run.status} />}
               {linkedAgentName && issue ? <span>{linkedAgentName}</span> : null}
               <span className="truncate max-w-(--sz-300px)">{displayError}</span>
               <span>{timeAgo(run.createdAt)}</span>
@@ -448,7 +466,7 @@ export function FailedRunInboxRow({
           {onArchive ? (
             <InboxArchiveButton onArchive={onArchive} disabled={archiveDisabled} />
           ) : null}
-          <Button
+          {retryAvailable && <Button
             type="button"
             variant="outline"
             size="sm"
@@ -457,8 +475,8 @@ export function FailedRunInboxRow({
             disabled={isRetrying}
           >
             <RotateCcw className="mr-1.5 h-3.5 w-3.5" />
-            {isRetrying ? "Retrying…" : "Retry"}
-          </Button>
+            {isRetrying ? "Thinking" : "Retry"}
+          </Button>}
           {!showUnreadSlot && (
             <button
               type="button"
@@ -472,7 +490,7 @@ export function FailedRunInboxRow({
         </div>
       </div>
       <div className="mt-3 flex gap-2 sm:hidden">
-        <Button
+        {retryAvailable && <Button
           type="button"
           variant="outline"
           size="sm"
@@ -481,8 +499,8 @@ export function FailedRunInboxRow({
           disabled={isRetrying}
         >
           <RotateCcw className="mr-1.5 h-3.5 w-3.5" />
-          {isRetrying ? "Retrying…" : "Retry"}
-        </Button>
+          {isRetrying ? "Thinking" : "Retry"}
+        </Button>}
         {!showUnreadSlot && (
           <button
             type="button"
@@ -790,12 +808,35 @@ function InboxCollectionToolbar({
   );
 }
 
-export function Inbox() {
-  const { enabled: streamlinedUiEnabled } = useStreamlinedUiEnabled();
-  return streamlinedUiEnabled ? <StreamlinedInbox /> : <LegacyInbox />;
+/**
+ * PAP-670: the inbox stopped being its own page and became the "My work" half
+ * of Tasks. `Tasks` hosts this component and drives it through these props, so
+ * every inbox behaviour (unread state, archive, date groups, the mixed
+ * approval / failed-run / join-request rows) survives the merge by construction
+ * rather than being reimplemented on the task list.
+ *
+ * With no props it is still the standalone `/inbox/*` page, which the legacy
+ * (non-streamlined) shell continues to use.
+ */
+export interface InboxSurfaceProps {
+  /** Which view to render. Falls back to the last path segment when absent. */
+  tab?: InboxTab;
+  /** Replaces the inbox tab bar in the toolbar's context slot. */
+  toolbarContext?: ReactNode;
+  /** Breadcrumb and back-link label; "Inbox" when standalone, "Tasks" when hosted. */
+  surfaceLabel?: string;
 }
 
-function StreamlinedInbox() {
+export function Inbox(props: InboxSurfaceProps = {}) {
+  const { enabled: streamlinedUiEnabled } = useStreamlinedUiEnabled();
+  return streamlinedUiEnabled ? <StreamlinedInbox {...props} /> : <LegacyInbox />;
+}
+
+function StreamlinedInbox({
+  tab: tabOverride,
+  toolbarContext,
+  surfaceLabel = "Inbox",
+}: InboxSurfaceProps) {
   const streamlinedUiEnabled = true;
   const { selectedCompanyId } = useCompany();
   const { setBreadcrumbs } = useBreadcrumbs();
@@ -806,7 +847,6 @@ function StreamlinedInbox() {
   const location = useLocation();
   const queryClient = useQueryClient();
   const [actionError, setActionError] = useState<string | null>(null);
-  const { keyboardShortcutsEnabled } = useGeneralSettings();
   const { data: experimentalSettings } = useQuery({
     queryKey: queryKeys.instance.experimentalSettings,
     queryFn: () => instanceSettingsApi.getExperimental(),
@@ -830,7 +870,7 @@ function StreamlinedInbox() {
   const { allCategoryFilter, allApprovalFilter, issueFilters } = filterPreferences;
 
   const pathSegment = location.pathname.split("/").pop() ?? "mine";
-  const tab: InboxTab =
+  const pathTab: InboxTab =
     pathSegment === "mine"
     || pathSegment === "recent"
     || pathSegment === "all"
@@ -838,15 +878,16 @@ function StreamlinedInbox() {
     || pathSegment === "blocked"
       ? pathSegment
       : "mine";
+  const tab: InboxTab = tabOverride ?? pathTab;
   const canArchiveFromTab = isMineInboxTab(tab);
   const issueLinkState = useMemo(
     () =>
       createIssueDetailLocationState(
-        "Inbox",
+        surfaceLabel,
         `${location.pathname}${location.search}${location.hash}`,
         "inbox",
       ),
-    [location.pathname, location.search, location.hash],
+    [surfaceLabel, location.pathname, location.search, location.hash],
   );
 
   const { data: session } = useQuery({
@@ -881,8 +922,8 @@ function StreamlinedInbox() {
   });
 
   useEffect(() => {
-    setBreadcrumbs([{ label: "Inbox" }]);
-  }, [setBreadcrumbs]);
+    setBreadcrumbs([{ label: surfaceLabel }]);
+  }, [setBreadcrumbs, surfaceLabel]);
 
   useEffect(() => {
     saveLastInboxTab(tab);
@@ -1086,17 +1127,19 @@ function StreamlinedInbox() {
       ...queryKeys.issues.search(selectedCompanyId!, normalizedSearchQuery, undefined, 25),
       "compact",
       "inbox-supplement",
+      issueFilters.showAgentCreatedTasks,
       "live-descendant-summary",
     ],
     queryFn: () =>
       issuesApi.listCompact(selectedCompanyId!, {
         q: normalizedSearchQuery,
         limit: 25,
+        includeAgentCreatedTasks: issueFilters.showAgentCreatedTasks,
+        includeParticipatedTasks: true,
         includeRoutineExecutions: true,
         includeLiveDescendantSummary: true,
       }).then((rows) => rows as Issue[]),
     enabled: shouldUseIssueSearchSupplement,
-    placeholderData: (previousData) => previousData,
   });
   const liveIssueIds = useMemo(
     () => collectLiveIssueIds(liveRuns, [
@@ -1127,11 +1170,11 @@ function StreamlinedInbox() {
     externalObjectSummariesReady: externalObjectSummariesReady && !externalObjectSummariesLoading,
   }), [externalObjectSummariesLoading, externalObjectSummariesReady, externalObjectSummaryByIssueId]);
   const visibleMineIssues = useMemo(
-    () => applyIssueFilters(mineIssues, issueFilters, currentUserId, true, liveIssueIds, issueFilterContext),
+    () => applyIssueFilters(mineIssues, issueFilters, currentUserId, false, liveIssueIds, issueFilterContext),
     [mineIssues, issueFilters, currentUserId, liveIssueIds, issueFilterContext],
   );
   const visibleTouchedIssues = useMemo(
-    () => applyIssueFilters(touchedIssues, issueFilters, currentUserId, true, liveIssueIds, issueFilterContext),
+    () => applyIssueFilters(touchedIssues, issueFilters, currentUserId, false, liveIssueIds, issueFilterContext),
     [touchedIssues, issueFilters, currentUserId, liveIssueIds, issueFilterContext],
   );
   const unreadTouchedIssues = useMemo(
@@ -1304,9 +1347,10 @@ function StreamlinedInbox() {
   const failedRuns = useMemo(
     () =>
       getLatestFailedRunsByAgent(heartbeatRuns ?? []).filter(
-        (r) => !isInboxEntityDismissed(dismissedAtByKey, `run:${r.id}`, r.createdAt),
+        (r) => !isInboxEntityDismissed(dismissedAtByKey, `run:${r.id}`, r.createdAt)
+          && issueById.get(readIssueIdFromRun(r) ?? "")?.interruption?.state !== "resolved",
       ),
-    [heartbeatRuns, dismissedAtByKey],
+    [heartbeatRuns, dismissedAtByKey, issueById],
   );
   const approvalsToRender = useMemo(() => {
     let filtered = getApprovalsForTab(approvals ?? [], tab, allApprovalFilter, currentUserId);
@@ -1328,8 +1372,9 @@ function StreamlinedInbox() {
   const showAlertsCategory = allCategoryFilter === "everything" || allCategoryFilter === "alerts";
   const failedRunsForTab = useMemo(() => {
     if (tab === "all" && !showFailedRunsCategory) return [];
+    if (tab === "mine") return failedRuns.filter((run) => isHeartbeatRunVisibleInMine(run, currentUserId));
     return failedRuns;
-  }, [failedRuns, tab, showFailedRunsCategory]);
+  }, [failedRuns, tab, showFailedRunsCategory, currentUserId]);
 
   const joinRequestsForTab = useMemo(() => {
     if (tab === "all" && !showJoinRequestsCategory) return [];
@@ -1437,7 +1482,7 @@ function StreamlinedInbox() {
         remoteIssues: remoteIssueSearchResults,
         issueFilters,
         currentUserId,
-        enableRoutineVisibilityFilter: true,
+        enableAgentCreatedVisibilityFilter: false,
         liveIssueIds,
         issueFilterContext,
       }),
@@ -1788,9 +1833,26 @@ function StreamlinedInbox() {
   });
 
   const [retryingRunIds, setRetryingRunIds] = useState<Set<string>>(new Set());
+  const retryRequestKeys = useRef(new Map<string, string>());
 
   const retryRunMutation = useMutation({
     mutationFn: async (run: HeartbeatRun) => {
+      const issueId = readIssueIdFromRun(run);
+      if (issueId) {
+        let idempotencyKey = retryRequestKeys.current.get(run.id);
+        if (!idempotencyKey) {
+          idempotencyKey = crypto.randomUUID();
+          retryRequestKeys.current.set(run.id, idempotencyKey);
+        }
+        const result = await issuesApi.retryTask(issueId, { idempotencyKey, observedRunId: run.id }).catch(error => {
+          if (error instanceof ApiError && error.status >= 400 && error.status < 500)
+            retryRequestKeys.current.delete(run.id);
+          throw error;
+        });
+        queryClient.setQueryData<Issue>(queryKeys.issues.detail(issueId), current =>
+          current ? { ...current, interruption: result.presentation } : current);
+        return { newRun: { runId: null, issueId }, originalRun: run };
+      }
       const result = await agentsApi.retryFailedRun(
         run.agentId,
         run.id,
@@ -1802,6 +1864,7 @@ function StreamlinedInbox() {
       setRetryingRunIds((prev) => new Set(prev).add(run.id));
     },
     onSuccess: ({ newRun, originalRun }) => {
+      retryRequestKeys.current.delete(originalRun.id);
       queryClient.invalidateQueries({ queryKey: queryKeys.heartbeats(originalRun.companyId) });
       queryClient.invalidateQueries({ queryKey: queryKeys.heartbeats(originalRun.companyId, originalRun.agentId) });
       if (newRun.runId)
@@ -2130,8 +2193,6 @@ function StreamlinedInbox() {
 
   // Keyboard shortcuts (mail-client style) — single stable listener using refs
   useEffect(() => {
-    if (!keyboardShortcutsEnabled) return;
-
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.defaultPrevented) return;
 
@@ -2320,7 +2381,7 @@ function StreamlinedInbox() {
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [issueLinkState, keyboardShortcutsEnabled, noteInboxSortInteraction]);
+  }, [issueLinkState, noteInboxSortInteraction]);
 
   // Scroll selected item into view
   useEffect(() => {
@@ -2331,7 +2392,7 @@ function StreamlinedInbox() {
   }, [selectedIndex]);
 
   if (!selectedCompanyId) {
-    return <EmptyState icon={InboxIcon} message="Select an organization to view inbox." />;
+    return <EmptyState icon={InboxIcon} message={`Select an organization to view ${surfaceLabel.toLowerCase()}.`} />;
   }
 
   const hasRunFailures = failedRuns.length > 0;
@@ -2400,8 +2461,8 @@ function StreamlinedInbox() {
     <div className="space-y-6">
       <InboxCollectionToolbar
         streamlined={streamlinedUiEnabled}
-        ariaLabel="Inbox controls"
-        context={(
+        ariaLabel={`${surfaceLabel} controls`}
+        context={toolbarContext ?? (
           <Tabs value={tab} onValueChange={(value) => navigate(`/inbox/${value}`)}>
             <PageTabBar
               items={[
@@ -2419,7 +2480,7 @@ function StreamlinedInbox() {
             <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
             <Input
               type="search"
-              placeholder="Search inbox…"
+              placeholder={`Search ${surfaceLabel.toLowerCase()}…`}
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               onKeyDown={(e) => {
@@ -2458,10 +2519,9 @@ function StreamlinedInbox() {
                 labels={labels?.map((label) => ({ id: label.id, name: label.name, color: label.color }))}
                 currentUserId={currentUserId}
                 enableExternalObjectFilters={externalObjectsEnabled}
-                enableRoutineVisibilityFilter
+                enableAgentCreatedVisibilityFilter
                 buttonVariant="outline"
                 iconOnly
-                workspaces={isolatedWorkspacesEnabled ? executionWorkspaces.filter((w) => w.mode === "isolated_workspace").map((w) => ({ id: w.id, name: w.name })) : undefined}
                 presentation={streamlinedUiEnabled ? "streamlined" : "legacy"}
               />
               <Popover>
@@ -2507,7 +2567,7 @@ function StreamlinedInbox() {
                   }));
                 }}
                 onResetColumns={() => setIssueColumns(DEFAULT_INBOX_ISSUE_COLUMNS)}
-                title="Choose which inbox columns stay visible"
+                title="Choose which columns stay visible"
                 iconOnly
               />
               <Popover>
@@ -2564,10 +2624,9 @@ function StreamlinedInbox() {
                 labels={labels?.map((label) => ({ id: label.id, name: label.name, color: label.color }))}
                 currentUserId={currentUserId}
                 enableExternalObjectFilters={externalObjectsEnabled}
-                enableRoutineVisibilityFilter
+                enableAgentCreatedVisibilityFilter
                 buttonVariant="outline"
                 iconOnly
-                workspaces={isolatedWorkspacesEnabled ? executionWorkspaces.filter((w) => w.mode === "isolated_workspace").map((w) => ({ id: w.id, name: w.name })) : undefined}
                 presentation={streamlinedUiEnabled ? "streamlined" : "legacy"}
                 inboxScopeFilters={tab === "all" ? {
                   category: allCategoryFilter,
@@ -2633,7 +2692,7 @@ function StreamlinedInbox() {
                   }));
                 }}
                 onResetColumns={() => setIssueColumns(DEFAULT_INBOX_ISSUE_COLUMNS)}
-                title="Choose which inbox columns stay visible"
+                title="Choose which columns stay visible"
                 iconOnly
                 rowPresentation={streamlinedUiEnabled ? "task" : "legacy"}
               />

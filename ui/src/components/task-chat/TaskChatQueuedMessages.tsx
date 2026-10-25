@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   DndContext,
   KeyboardSensor,
@@ -29,6 +29,7 @@ import type {
   IssueQueuedCommentQueue,
 } from "@paperclipai/shared";
 import { cn } from "@/lib/utils";
+import { TaskChatComposerBar } from "./TaskChatComposerBar";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -145,7 +146,7 @@ function SortableQueuedMessage({
         {label}
       </span>
 
-      {queue.protocol === "legacy" || entry.source?.requiresFreshSession ? (
+      {queue.targetRunId && (queue.protocol === "legacy" || entry.source?.requiresFreshSession ? (
         <button
           type="button"
           onClick={onInterrupt}
@@ -177,7 +178,7 @@ function SortableQueuedMessage({
           )}
           Steer
         </button>
-      )}
+      ))}
 
       <button
         type="button"
@@ -232,6 +233,9 @@ export function TaskChatQueuedMessages({
   onDiscard,
 }: TaskChatQueuedMessagesProps) {
   const [entries, setEntries] = useState(queue.entries);
+  const latestQueue = useRef(queue);
+  latestQueue.current = queue;
+  const optimisticDeliveryIds = useRef(new Set<string>());
   const [pending, setPending] = useState<{
     commentId: string;
     action: Exclude<QueueAction, null>;
@@ -247,7 +251,10 @@ export function TaskChatQueuedMessages({
   );
 
   useEffect(() => {
-    setEntries(queue.entries);
+    // Polling can return the old queue while delivery is still in flight.
+    setEntries(queue.entries.filter(
+      (entry) => !optimisticDeliveryIds.current.has(entry.comment.id),
+    ));
   }, [queue.entries, queue.revision]);
 
   const ids = useMemo(
@@ -309,7 +316,15 @@ export function TaskChatQueuedMessages({
     ) {
       return;
     }
-    const previous = entries;
+    const deliveredIds = action === "interrupt"
+      ? entries.map((entry) => entry.comment.id)
+      : action === "steer" ? [commentId] : [];
+    for (const id of deliveredIds) optimisticDeliveryIds.current.add(id);
+    if (deliveredIds.length) {
+      setEntries((current) => current.filter(
+        (entry) => !optimisticDeliveryIds.current.has(entry.comment.id),
+      ));
+    }
     setPending({ commentId, action });
     setVisibleError(null);
     setAnnouncement(
@@ -319,11 +334,6 @@ export function TaskChatQueuedMessages({
           ? "Sending queued messages."
           : "Discarding queued message.",
     );
-    if (action === "steer") {
-      setEntries((current) =>
-        current.filter((entry) => entry.comment.id !== commentId),
-      );
-    }
     try {
       if (action === "steer") await onSteer(commentId, queue.revision);
       else if (action === "interrupt") await onInterrupt?.();
@@ -341,7 +351,12 @@ export function TaskChatQueuedMessages({
             : "Queued message discarded.",
       );
     } catch (error) {
-      if (action === "steer") setEntries(previous);
+      for (const id of deliveredIds) optimisticDeliveryIds.current.delete(id);
+      if (deliveredIds.length) {
+        setEntries(latestQueue.current.entries.filter(
+          (entry) => !optimisticDeliveryIds.current.has(entry.comment.id),
+        ));
+      }
       setAnnouncement("");
       const code = queueActionErrorCode(error);
       setVisibleError(
@@ -360,19 +375,13 @@ export function TaskChatQueuedMessages({
     }
   }
 
-  if (entries.length === 0) return null;
+  if (entries.length === 0 && !visibleError) return null;
 
   return (
-    <div
-      className="relative z-0 mx-3 -mb-px overflow-hidden rounded-t-xl rounded-b-none border border-b-0 border-border/75 bg-card shadow-sm"
+    <TaskChatComposerBar
       data-testid="task-chat-queued-messages"
       aria-label="Queued messages"
     >
-      {queue.executionWait && (
-        <div role="status" aria-live="polite" className="px-3 py-1.5 text-xs text-muted-foreground">
-          {queue.executionWait.message}
-        </div>
-      )}
       <DndContext
         sensors={sensors}
         collisionDetection={closestCenter}
@@ -419,6 +428,6 @@ export function TaskChatQueuedMessages({
       <div className="sr-only" aria-live="polite" aria-atomic="true">
         {announcement}
       </div>
-    </div>
+    </TaskChatComposerBar>
   );
 }

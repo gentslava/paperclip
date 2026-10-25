@@ -3,8 +3,11 @@ import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
+  authUsers,
   agentWakeupRequests,
+  agentRuntimeState,
   companies,
+  companyMemberships,
   costEvents,
   createDb,
   documentRevisions,
@@ -22,6 +25,8 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
+import { truncateTablesWithDeadlockRetry } from "./helpers/truncate-with-deadlock-retry.js";
 import {
   MAX_TURN_CONTINUATION_RETRY_REASON,
   MAX_TURN_CONTINUATION_WAKE_REASON,
@@ -89,42 +94,30 @@ async function waitForCondition(fn: () => Promise<boolean>, timeoutMs = 3_000) {
 }
 
 async function cleanupHeartbeatInvalidationFixture(db: ReturnType<typeof createDb>) {
-  for (let attempt = 0; attempt < 10; attempt += 1) {
-    try {
-      await db.execute(sql.raw(`
-        TRUNCATE TABLE
-          "company_skills",
-          "issue_comments",
-          "issue_documents",
-          "document_revisions",
-          "documents",
-          "issue_relations",
-          "issue_tree_holds",
-          "issues",
-          "heartbeat_run_events",
-          "cost_events",
-          "activity_log",
-          "heartbeat_runs",
-          "agent_wakeup_requests",
-          "agent_runtime_state",
-          "agents",
-          "companies"
-        RESTART IDENTITY CASCADE
-      `));
-      return;
-    } catch (error) {
-      const isLateCommentRace =
-        error instanceof Error &&
-        error.message.includes("issue_comments_issue_id_issues_id_fk");
-      if (!isLateCommentRace || attempt === 9) {
-        throw error;
-      }
-
-      // Heartbeat completion can write issue-thread comments shortly after the
-      // run leaves queued/running. Retry the dependent deletes once those land.
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-  }
+  await truncateTablesWithDeadlockRetry(
+    db,
+    `
+      TRUNCATE TABLE
+        "company_skills",
+        "issue_comments",
+        "issue_documents",
+        "document_revisions",
+        "documents",
+        "issue_relations",
+        "issue_tree_holds",
+        "issues",
+        "heartbeat_run_events",
+        "cost_events",
+        "activity_log",
+        "heartbeat_runs",
+        "agent_wakeup_requests",
+        "agent_runtime_state",
+        "agents",
+        "companies"
+      RESTART IDENTITY CASCADE
+    `,
+    { attempts: 10, delayMs: () => 100 },
+  );
 }
 
 type SeedOptions = {
@@ -182,22 +175,14 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       model: "test-model",
     }));
     runningProcesses.clear();
-    let idlePolls = 0;
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      const runs = await db
-        .select({ status: heartbeatRuns.status })
-        .from(heartbeatRuns);
-      const hasActiveRun = runs.some((run) => run.status === "queued" || run.status === "running");
-      if (!hasActiveRun) {
-        idlePolls += 1;
-        if (idlePolls >= 3) break;
-      } else {
-        idlePolls = 0;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    // A table poll for "queued" or "running" rows cannot see a wakeup promise
+    // that has not yet written its run row. The shared drain helper awaits
+    // both in-flight wakeup promises and in-flight run executions first, then
+    // re-checks the run table, so a late writer cannot still be in flight when
+    // the TRUNCATE below runs.
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
     await cleanupHeartbeatInvalidationFixture(db);
+    await db.delete(authUsers).where(eq(authUsers.id, "responsible-user"));
   });
 
   afterAll(async () => {
@@ -213,6 +198,22 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       defaultResponsibleUserId: "responsible-user",
       requireBoardApprovalForNewAgents: false,
+    });
+    // Admission intersects agent authority with an existing responsible user
+    // and that user's active company membership.
+    await db.insert(authUsers).values({
+      id: "responsible-user",
+      name: "Fixture user",
+      email: "responsible-user@example.test",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    }).onConflictDoNothing();
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: "responsible-user",
+      status: "active",
+      membershipRole: "member",
     });
     await db.insert(agents).values({
       id: agentId,
@@ -233,6 +234,57 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     });
     return { companyId, agentId };
   }
+
+  it.each(["legacy", "native"])("delivers an accepted non-assignee queue after its %s owner finished", async runtimeMode => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const [recipient] = await db.insert(agents).values({ companyId, name: "Saved feedback recipient", role: "engineer",
+      status: "idle", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: { heartbeat: { wakeOnDemand: true } }, permissions: {},
+    }).returning();
+    const [issue] = await db.insert(issues).values({ companyId, title: "Existing accepted feedback", status: "in_progress", assigneeAgentId: agentId }).returning();
+    const [owner] = await db.insert(heartbeatRuns).values({ companyId, agentId, invocationSource: "assignment", status: "succeeded",
+      runtimeMode, nativeIssueId: runtimeMode === "native" ? issue.id : null, startedAt: new Date(), finishedAt: new Date(), contextSnapshot: { issueId: issue.id },
+    }).returning();
+    if (runtimeMode === "native") await db.insert(nativeRunFinalizations).values({ runId: owner.id, companyId, issueId: issue.id, phase: "committed" });
+    const [comment] = await db.insert(issueComments).values({ companyId, issueId: issue.id, body: "Saved feedback for the recipient",
+      authorAgentId: agentId, createdByRunId: owner.id,
+    }).returning();
+    const [wake] = await db.insert(agentWakeupRequests).values({ companyId, agentId: recipient.id, source: "automation",
+      reason: "issue_execution_deferred", status: "deferred_issue_execution", requestedByActorType: "agent", requestedByActorId: agentId,
+      payload: withQueuedCommentIdsInWakePayload({ issueId: issue.id, _paperclipWakeContext: {
+        issueId: issue.id, wakeReason: "issue_comment_mentioned", wakeSource: "automation",
+      } }, [comment.id]),
+    }).returning();
+    await heartbeat.resumeQueuedRuns();
+    const [delivered] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake.id));
+    expect(delivered.runId).toBeTruthy();
+    await heartbeat.waitForRunExecutionDrain(delivered.runId!);
+    expect(countExecuteCallsForRun(delivered.runId!)).toBe(1);
+    expect((await heartbeat.getRun(delivered.runId!))?.contextSnapshot).toMatchObject({ wakeCommentIds: [comment.id] });
+    await heartbeat.resumeQueuedRuns();
+    expect(countExecuteCallsForRun(delivered.runId!)).toBe(1);
+    expect((await db.select().from(issueComments).where(eq(issueComments.id, comment.id)))[0]?.body).toBe(comment.body);
+    expect((await db.select().from(issues).where(eq(issues.id, issue.id)))[0]?.assigneeAgentId).toBe(agentId);
+  });
+
+  it.each(["preparing", "verifying", "resuming"] as const)("keeps assigned work queued through %s, including recovery with timers disabled", async lifecycleState => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ heartbeatConfig: { enabled: false } });
+    await db.update(agents).set({ status: "paused", lifecycleState }).where(eq(agents.id, agentId));
+    const [issue] = await db.insert(issues).values({ companyId, title: "Work accepted during setup", status: "todo", assigneeAgentId: agentId }).returning();
+    const run = await heartbeat.wakeup(agentId, { source: "assignment", triggerDetail: "system", reason: "issue_assigned",
+      requestedByActorType: "system", payload: { issueId: issue.id } });
+    expect(run?.status).toBe("queued");
+    await heartbeat.resumeQueuedRuns();
+    expect((await heartbeat.getRun(run!.id))?.status).toBe("queued");
+    expect(countExecuteCallsForRun(run!.id)).toBe(0);
+    expect((await heartbeat.reconcileStrandedAssignedIssues()).escalated).toBe(0);
+    expect((await db.select().from(issues).where(eq(issues.id, issue.id)))[0]).toMatchObject({ status: "todo", assigneeAgentId: agentId });
+    await db.update(agents).set({ status: "idle", lifecycleState: "ready" }).where(eq(agents.id, agentId));
+    const recovered = heartbeatService(db, { runtimeEnv: { ...process.env, PAPERCLIP_IN_WORKTREE: "false" } });
+    await recovered.resumeQueuedRuns();
+    expect(await waitForCondition(async () => countExecuteCallsForRun(run!.id) === 1)).toBe(true);
+    await recovered.waitForRunExecutionDrain(run!.id);
+    expect(countExecuteCallsForRun(run!.id)).toBe(1);
+  });
 
   async function seedQueuedRun(input: {
     companyId: string;
@@ -1244,6 +1296,41 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         }),
       ]),
     );
+  });
+
+  it.each(["codex_local", "gemini_local"].flatMap(adapterType => [
+    { adapterType, inputTokens: 50_000, cachedInputTokens: 550_000, rotate: true, rawInputIncludesCached: false },
+    { adapterType, inputTokens: 50_000, cachedInputTokens: 449_999, rotate: false, rawInputIncludesCached: false },
+    { adapterType, inputTokens: 0, cachedInputTokens: 500_000, rotate: true, rawInputIncludesCached: false },
+    { adapterType, inputTokens: 400_000, cachedInputTokens: 350_000, rotate: false, rawInputIncludesCached: undefined },
+    { adapterType, inputTokens: 500_000, cachedInputTokens: 350_000, rotate: true, rawInputIncludesCached: undefined },
+  ]))("counts cached prompt input for $adapterType session rotation ($inputTokens + $cachedInputTokens; raw includes cache: $rawInputIncludesCached)", async ({ adapterType, inputTokens, cachedInputTokens, rotate, rawInputIncludesCached }) => {
+    const { companyId, agentId } = await seedCompanyAndAgent({ heartbeatConfig: {
+      sessionCompaction: { enabled: true, maxSessionRuns: 0, maxRawInputTokens: 500_000, maxSessionAgeHours: 0 },
+    } });
+    const sessionId = randomUUID();
+    await db.update(agents).set({ adapterType }).where(eq(agents.id, agentId));
+    await db.insert(agentRuntimeState).values({ companyId, agentId, adapterType, sessionId });
+    await db.insert(heartbeatRuns).values({ companyId, agentId, status: "succeeded", sessionIdAfter: sessionId,
+      usageJson: { ...(rawInputIncludesCached === false ? { rawInputIncludesCached } : {}), inputTokens, cachedInputTokens, outputTokens: 10, rawInputTokens: inputTokens, rawCachedInputTokens: cachedInputTokens },
+      resultJson: { summary: "Continue from this completed turn" }, startedAt: new Date(), finishedAt: new Date(),
+    });
+    mockAdapterExecute.mockResolvedValueOnce({ exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+      provider: "test", model: "test-model", costUsd: 0, usageComplete: true, usageBasis: "per_run",
+      usage: { inputTokens: 1, cachedInputTokens: 2, outputTokens: 3 },
+    });
+    const run = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "manual" });
+    expect(run).not.toBeNull();
+    expect(await waitForCondition(() => Promise.resolve(countExecuteCallsForRun(run!.id) === 1))).toBe(true);
+    const [context] = mockAdapterExecute.mock.calls.find(([context]) => context?.runId === run!.id)!;
+    expect(context.runtime.sessionId).toBe(rotate ? null : sessionId);
+    if (rotate) {
+      expect(context.context.paperclipSessionRotationReason).toContain((inputTokens + (rawInputIncludesCached === false ? cachedInputTokens : 0)).toLocaleString("en-US"));
+      expect(context.context.paperclipSessionHandoffMarkdown).toContain("Continue from this completed turn");
+    } else expect(context.context.paperclipSessionRotationReason).toBeUndefined();
+    await heartbeat.drainActiveRunExecutions();
+    const [finished] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run!.id));
+    expect(finished.usageJson).toMatchObject({ rawInputTokens: 1, rawCachedInputTokens: 2, rawInputIncludesCached: false });
   });
 
   it("skips wakes before queueing when per-agent daily cost cap is reached", async () => {
