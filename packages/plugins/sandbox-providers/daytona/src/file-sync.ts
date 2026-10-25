@@ -2,7 +2,7 @@ import path from "node:path";
 import os from "node:os";
 import { promises as fs, createReadStream, createWriteStream } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import zlib from "node:zlib";
 import { pipeline } from "node:stream/promises";
@@ -14,6 +14,7 @@ import type {
   PluginSyncFileMapping,
   PluginSyncOperation,
 } from "@paperclipai/plugin-sdk";
+import { recordEnvironmentSyncError, withEnvironmentSyncTransferStep } from "@paperclipai/plugin-sdk";
 import { getPluginTracer } from "./plugin.js";
 
 const execFileAsync = promisify(execFile);
@@ -151,7 +152,7 @@ async function withHostTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
 }
 
 /**
- * Build a host-side tarball of a directory, mirroring the runtime's own
+ * Build a host-side gzip-compressed tarball of a directory, mirroring the runtime's own
  * `createTarballFromDirectory`: archive top-level entries by name (no "." self
  * entry), suppress AppleDouble/xattr sidecars, honor `exclude`, and reproduce the
  * `followSymlinks` → `-h` mapping so the native path is observationally identical
@@ -167,14 +168,17 @@ async function createHostTarball(input: {
   const entries = (await fs.readdir(input.localDir)).sort((left, right) => left.localeCompare(right));
   if (entries.length === 0) {
     // An empty source is valid (blank workspace / empty asset dir). Write a valid
-    // empty tar (1024-byte zero EOF marker) so extraction is a clean no-op.
-    await fs.writeFile(input.archivePath, Buffer.alloc(1024));
+    // gzip-compressed empty tar (1024-byte zero EOF marker) so extraction is a
+    // clean no-op and uses the same transport as non-empty directories.
+    await fs.writeFile(input.archivePath, await new Promise<Buffer>((resolve, reject) => {
+      zlib.gzip(Buffer.alloc(1024), (error, compressed) => error ? reject(error) : resolve(compressed));
+    }));
     return;
   }
   await execFileAsync(
     "tar",
     [
-      "-c",
+      "-cz",
       "--no-xattrs",
       ...(input.followSymlinks ? ["-h"] : []),
       "-f",
@@ -247,54 +251,150 @@ export function splitLinkEntryOnce(field: string, delimiter: string): { name: st
  * preserved. Parses the `-tvf` verbose listing so both member names and link
  * targets are inspected; any unparseable line fails closed.
  */
-async function assertTarballEntriesConfined(archivePath: string): Promise<void> {
-  const { stdout } = await execFileAsync("tar", ["-tvf", archivePath], {
+class UnsafeOutboundArchiveError extends Error {}
+
+function assertTarListingLineConfined(line: string): void {
+  if (line.trim().length === 0) return;
+  const parsed = parseTarVerboseListingLine(line);
+  if (!parsed) {
+    throw new UnsafeOutboundArchiveError(`Daytona syncOut refusing tarball with an unparseable entry listing: ${line}`);
+  }
+  const typeFlag = parsed.typeFlag;
+  let name = parsed.rest;
+  let linkTarget: string | null = null;
+  if (typeFlag === "l") {
+    const split = splitLinkEntryOnce(name, " -> ");
+    if (!split) throw new UnsafeOutboundArchiveError(`Daytona syncOut refusing unparseable or ambiguous symlink entry: ${line}`);
+    name = split.name;
+    linkTarget = split.target;
+  } else if (typeFlag === "h") {
+    const split = splitLinkEntryOnce(name, " link to ");
+    if (!split) throw new UnsafeOutboundArchiveError(`Daytona syncOut refusing unparseable or ambiguous hardlink entry: ${line}`);
+    name = split.name;
+    linkTarget = split.target;
+  }
+  const cleanName = name.replace(/\/+$/, "");
+  if (cleanName.length > 0 && posixPathEscapes(cleanName)) {
+    throw new UnsafeOutboundArchiveError(`Daytona syncOut refusing tarball member that escapes the extraction dir: ${name}`);
+  }
+  if (linkTarget !== null) {
+    const resolved = path.posix.join(path.posix.dirname(cleanName), linkTarget);
+    if (path.posix.isAbsolute(linkTarget) || posixPathEscapes(resolved)) {
+      throw new UnsafeOutboundArchiveError(
+        `Daytona syncOut refusing tarball link whose target escapes the extraction dir: ${name} -> ${linkTarget}`,
+      );
+    }
+  }
+}
+
+const TAR_LISTING_MAX_LINE_BYTES = 64 * 1024;
+const TAR_LISTING_MAX_STDERR_BYTES = 64 * 1024;
+// Full workspace exports are larger than provider checkpoints. These quotas
+// admit the supported 60k-file / 39.8 MB-name export and 145k-entry regression,
+// while bounding work on untrusted metadata independently of the wall deadline.
+// The byte quota matches the native workspace descriptor's 64 MiB ceiling;
+// it is an admission counter, never a buffer allocation.
+const TAR_LISTING_MAX_TOTAL_BYTES = 64 * 1024 * 1024;
+const TAR_LISTING_MAX_ENTRIES = 250_000;
+const TAR_LISTING_TIMEOUT_MS = 120_000;
+
+export async function assertTarballEntriesConfined(
+  archivePath: string,
+  timeoutMs = TAR_LISTING_TIMEOUT_MS,
+): Promise<void> {
+  // A valid large workspace can exceed execFile's buffer. Stream within both
+  // aggregate admission quotas and per-entry/diagnostic memory bounds, checking
+  // every entry before extraction. Keep bytes until a full line to preserve
+  // UTF-8 characters split across pipe chunks.
+  const child = spawn("tar", ["-tvf", archivePath], {
     env: { ...process.env, COPYFILE_DISABLE: "1" },
-    maxBuffer: 32 * 1024 * 1024,
+    stdio: ["ignore", "pipe", "pipe"],
   });
-  const lines = stdout.split("\n").filter((line) => line.trim().length > 0);
-  for (const line of lines) {
-    const parsed = parseTarVerboseListingLine(line);
-    if (!parsed) {
-      throw new Error(`Daytona syncOut refusing tarball with an unparseable entry listing: ${line}`);
+  let spawnError: Error | undefined;
+  let failure: Error | undefined;
+  let stderr = Buffer.alloc(0);
+  let pending: Buffer = Buffer.alloc(0);
+  let totalBytes = 0;
+  let entries = 0;
+  const validateLine = (line: Buffer) => {
+    // Count empty lines too, so whitespace cannot evade the parsing-work quota.
+    if (++entries > TAR_LISTING_MAX_ENTRIES) {
+      throw recordEnvironmentSyncError(new Error("Daytona syncOut tar listing entry limit exceeded (250000)"), { transferFailureKind: "listing_entry_limit" });
     }
-    const typeFlag = parsed.typeFlag;
-    let name = parsed.rest;
-    let linkTarget: string | null = null;
-    if (typeFlag === "l") {
-      const split = splitLinkEntryOnce(name, " -> ");
-      if (!split) throw new Error(`Daytona syncOut refusing unparseable or ambiguous symlink entry: ${line}`);
-      name = split.name;
-      linkTarget = split.target;
-    } else if (typeFlag === "h") {
-      const split = splitLinkEntryOnce(name, " link to ");
-      if (!split) throw new Error(`Daytona syncOut refusing unparseable or ambiguous hardlink entry: ${line}`);
-      name = split.name;
-      linkTarget = split.target;
+    try { assertTarListingLineConfined(line.toString("utf8")); }
+    catch (error) {
+      if (error instanceof UnsafeOutboundArchiveError) recordEnvironmentSyncError(error, { transferFailureKind: "unsafe_archive" });
+      throw error;
     }
-    const cleanName = name.replace(/\/+$/, "");
-    if (cleanName.length > 0 && posixPathEscapes(cleanName)) {
-      throw new Error(`Daytona syncOut refusing tarball member that escapes the extraction dir: ${name}`);
+  };
+  const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+    child.once("error", (error) => { spawnError = error; });
+    child.once("close", (code, signal) => resolve({ code, signal }));
+  });
+  const stop = (error: Error) => {
+    failure ??= error;
+    child.kill("SIGKILL");
+  };
+  const timer = setTimeout(() => {
+    stop(recordEnvironmentSyncError(new Error("Daytona syncOut tar listing validation timed out"), { transferFailureKind: "listing_timeout", errorCode: "ETIMEDOUT" }));
+  }, Math.max(1, Math.min(timeoutMs, TAR_LISTING_TIMEOUT_MS)));
+  child.stderr.on("data", (chunk: Buffer) => {
+    if (stderr.length + chunk.length > TAR_LISTING_MAX_STDERR_BYTES) {
+      stop(recordEnvironmentSyncError(new Error("Daytona syncOut tar listing diagnostics exceed the byte limit"), { transferFailureKind: "listing_stderr_limit" }));
+      return;
     }
-    if (linkTarget !== null) {
-      const resolved = path.posix.join(path.posix.dirname(cleanName), linkTarget);
-      if (path.posix.isAbsolute(linkTarget) || posixPathEscapes(resolved)) {
-        throw new Error(
-          `Daytona syncOut refusing tarball link whose target escapes the extraction dir: ${name} -> ${linkTarget}`,
-        );
+    stderr = Buffer.concat([stderr, chunk]);
+  });
+  try {
+    for await (const chunk of child.stdout) {
+      if (failure) break;
+      const bytes = chunk as Buffer;
+      totalBytes += bytes.length;
+      if (totalBytes > TAR_LISTING_MAX_TOTAL_BYTES) {
+        throw recordEnvironmentSyncError(new Error("Daytona syncOut tar total listing byte limit exceeded (64 MiB)"), { transferFailureKind: "listing_byte_limit" });
+      }
+      let start = 0;
+      while (start < bytes.length) {
+        const newline = bytes.indexOf(10, start);
+        const end = newline < 0 ? bytes.length : newline;
+        if (pending.length + end - start > TAR_LISTING_MAX_LINE_BYTES) {
+          throw recordEnvironmentSyncError(new Error("Daytona syncOut refusing tarball with an entry listing exceeding the byte limit"), { transferFailureKind: "listing_line_limit" });
+        }
+        pending = Buffer.concat([pending, bytes.subarray(start, end)]);
+        if (newline < 0) break;
+        validateLine(pending);
+        pending = Buffer.alloc(0);
+        start = newline + 1;
       }
     }
+    if (!failure && pending.length > 0) validateLine(pending);
+    const result = await closed;
+    if (failure) throw failure;
+    if (spawnError) throw spawnError;
+    if (result.code !== 0) {
+      throw recordEnvironmentSyncError(new Error(`Daytona syncOut tar listing failed (${result.signal ?? result.code}): ${stderr.toString("utf8").trim()}`), {
+        transferFailureKind: "command_failed", exitCode: result.code ?? undefined,
+      });
+    }
+  } catch (error) {
+    stop(error instanceof Error ? error : new Error(String(error)));
+    await closed;
+    throw failure;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
 async function extractHostTarball(input: { archivePath: string; localDir: string }): Promise<void> {
   // The archive is sandbox-authored and untrusted: validate every member (and
   // link target) is confined before letting host-side tar write a single byte.
-  await assertTarballEntriesConfined(input.archivePath);
-  await fs.mkdir(input.localDir, { recursive: true });
-  await execFileAsync("tar", ["-xf", input.archivePath, "-C", input.localDir], {
-    env: { ...process.env, COPYFILE_DISABLE: "1" },
-    maxBuffer: 32 * 1024 * 1024,
+  await withEnvironmentSyncTransferStep("archive_validate", () => assertTarballEntriesConfined(input.archivePath));
+  await withEnvironmentSyncTransferStep("archive_extract", async () => {
+    await fs.mkdir(input.localDir, { recursive: true });
+    await execFileAsync("tar", ["-xf", input.archivePath, "-C", input.localDir], {
+      env: { ...process.env, COPYFILE_DISABLE: "1" },
+      maxBuffer: 32 * 1024 * 1024,
+    });
   });
 }
 
@@ -332,7 +432,9 @@ async function assertSandboxCommandOkWithOutput(
   const result = await sandbox.process.executeCommand(command, undefined, undefined, timeoutSeconds);
   if ((result.exitCode ?? 1) !== 0) {
     const detail = (result.result ?? result.artifacts?.stdout ?? "").toString().trim();
-    throw new Error(`Daytona ${label} command failed (exit ${result.exitCode ?? "unknown"})${detail ? `: ${detail}` : ""}`);
+    throw recordEnvironmentSyncError(new Error(`Daytona ${label} command failed (exit ${result.exitCode ?? "unknown"})${detail ? `: ${detail}` : ""}`), {
+      transferFailureKind: "command_failed", exitCode: result.exitCode,
+    });
   }
   return (result.result ?? result.artifacts?.stdout ?? "").toString();
 }
@@ -375,6 +477,18 @@ const ZSTD_PROBE_MARKER = "PAPERCLIP_ZSTD_AVAILABLE";
  */
 function isZstdCompressionSupported(): boolean {
   return typeof zlib.createZstdCompress === "function";
+}
+
+async function hasCompressedHeader(sourcePath: string): Promise<boolean> {
+  const file = await fs.open(sourcePath, "r");
+  try {
+    const header = Buffer.alloc(4);
+    const { bytesRead } = await file.read(header, 0, header.length, 0);
+    return (bytesRead === 4 && header.readUInt32LE(0) === 0xfd2fb528)
+      || (bytesRead >= 3 && header[0] === 0x1f && header[1] === 0x8b && header[2] === 8);
+  } finally {
+    await file.close();
+  }
 }
 
 /**
@@ -593,11 +707,10 @@ async function sweepZstdScratchAfterSuccess(
 interface FileMappingPlan {
   mapping: PluginSyncFileMapping;
   sourceSize: number;
-  dir: string;
   /** Reserved scratch name for the FINAL bytes at `targetPath`, a direct child
    * of `remoteDir`. For a raw mapping the host uploads directly to this name.
    * For a compressed mapping the host never creates this name — the in-sandbox
-   * decompression step does (Security Condition C1). */
+   * decompression step does. */
   rawScratch: string;
   compressed: null | {
     /** Reserved `.zst` scratch name, a direct child of `remoteDir`. */
@@ -623,21 +736,14 @@ async function syncInFileMappings(input: {
   let bytesTransferred = 0;
   const plans: FileMappingPlan[] = [];
   for (const mapping of mappings) {
-    assertConfinedSandboxPath(remoteDir, mapping.targetPath, "target");
-    const dir = path.posix.dirname(mapping.targetPath);
-    parentDirs.add(dir);
+    parentDirs.add(path.posix.dirname(mapping.targetPath));
     const sourceSize = (await fs.stat(mapping.sourcePath)).size;
     bytesTransferred += sourceSize;
     // Stage each upload to a reserved temp that is a DIRECT child of the workspace
-    // root (`remoteDir`), never a sibling of the target. The target's parent dir is
-    // sandbox-writable and can be swapped for a symlink to `/etc` (or any host path)
-    // after validation but before the write opens the destination — rooting the
-    // privileged write directly under `remoteDir` removes that swappable intermediate
-    // component, so the upload cannot be redirected outside the root by a parent
-    // swap. `remoteDir` and the target dir share the workspace filesystem, so the
-    // closing `mv -f` is still an atomic same-fs rename and an interrupted upload
-    // never leaves a truncated file at targetPath.
-    plans.push({ mapping, sourceSize, dir, rawScratch: path.posix.join(remoteDir, scratchName()), compressed: null });
+    // root (`remoteDir`). `remoteDir` and the target dir share the workspace
+    // filesystem, so the closing `mv -f` is still an atomic same-fs rename and an
+    // interrupted upload never leaves a truncated file at targetPath.
+    plans.push({ mapping, sourceSize, rawScratch: path.posix.join(remoteDir, scratchName()), compressed: null });
   }
 
   // Count the serial guard round trips before the transfer, so the transfer span
@@ -668,25 +774,6 @@ async function syncInFileMappings(input: {
   // identical to a sandbox that has no `zstd` binary.
   const sandboxHasZstd = mkdirOutput.includes(ZSTD_PROBE_MARKER);
 
-  // Defense-in-depth beyond the lexical `assertConfinedSandboxPath`: a sandbox
-  // can replace a target parent with a symlink to `/etc` so the string check
-  // passes but the upload + `mv -f` resolve through it. Canonicalize every parent
-  // dir (now materialized) and fail closed if any escapes, BEFORE any bytes land.
-  // `checkSymlinkEscape` span: re-check a path resolves inside the workspace root
-  // before use.
-  await withProviderSpan({
-    name: "checkSymlinkEscape",
-    run: () =>
-      assertSandboxPathsConfined({
-        sandbox,
-        remoteDir,
-        paths: [...parentDirs],
-        timeoutSeconds,
-        label: "inbound symlink-escape guard",
-      }),
-  });
-  guardRoundTrips += 1;
-
   // Host-side compression, gated on the probe AND a runtime feature check (a
   // declared `engines.node` floor is an assumption, not a guarantee — always
   // feature-detect). Every candidate at or above `ZSTD_MIN_SOURCE_BYTES` is
@@ -706,6 +793,7 @@ async function syncInFileMappings(input: {
         for (const plan of compressCandidates) {
           let hostTempDir: string | null = null;
           try {
+            if (await hasCompressedHeader(plan.mapping.sourcePath)) continue;
             const compressed = await compressFileToHostTemp(plan.mapping.sourcePath);
             hostTempDir = compressed.dir;
             compressBytesIn += plan.sourceSize;
@@ -737,7 +825,7 @@ async function syncInFileMappings(input: {
   for (const plan of plans) {
     if (plan.compressed) {
       // Upload ONLY the `.zst` file. The host never creates the raw scratch
-      // name — the in-sandbox decompression step below does (C1).
+      // name — the in-sandbox decompression step below does.
       uploads.push({ source: plan.compressed.hostTempPath, destination: plan.compressed.zstdScratch });
     } else {
       uploads.push({ source: plan.mapping.sourcePath, destination: plan.rawScratch });
@@ -766,8 +854,7 @@ async function syncInFileMappings(input: {
   // scratch (some targets promoted, others not) — sweep every reserved name on
   // any error so a retry never accumulates stale `.paperclip-upload-*` scratch.
   // The private host temp directory is removed in `finally` regardless of
-  // outcome (C2's "no temp remains after success or failure" applies host-side
-  // too).
+  // outcome — no temp remains after success or failure.
   try {
     // One batched bulk upload (single /files/bulk-upload) for all file mappings.
     // `transfer` span: the real byte upload — `sandbox.fs.uploadFiles`.
@@ -784,99 +871,52 @@ async function syncInFileMappings(input: {
     // Apply the requested mode on the RAW mapping's temp file BEFORE the rename
     // so the target never appears at a widened window. A compressed mapping's
     // raw scratch does not exist yet at this point — its mode (if any) is
-    // applied inside the promotion script below, on the safe raw scratch (C3).
+    // applied inside the promotion script below, on the raw scratch.
     for (const apply of modeApplies) {
       await sandbox.fs.setFilePermissions(apply.temp, { mode: toOctalModeString(apply.mode) });
     }
 
-    // Promote every mapping onto its final target. The `mv -f` traverses the
-    // target's PARENT dir, which is sandbox-writable and could be swapped for a
-    // symlink after the earlier parent guard ran but before the rename opens it —
-    // redirecting the promotion outside the root. Bind the confinement re-check and
-    // the rename into ONE sandbox invocation: for each target, re-canonicalize its
-    // parent dir, confirm the resolved parent is still inside the workspace root,
-    // then OPEN that dir as fd 8 and `mv` into `/proc/self/fd/8/<base>`. Two races
-    // are closed:
-    //  - check→open (ancestor swap): `mv "$_pc_tgt_dir"/<base>` would re-walk the
-    //    parent path string and follow an ancestor the sandbox repointed to a
-    //    symlink after the `case` check. Opening fd 8 PINS the directory inode, and
-    //    an immediate re-canonicalize of `/proc/self/fd/8` confirms the pinned inode
-    //    is still in-root before any write — an ancestor swap before the open is
-    //    caught by this verify (fail closed, exit 42); a swap after the open cannot
-    //    change which inode fd 8 references.
-    //  - open→rename: `mv` targets `/proc/self/fd/8/<base>`, which resolves through
-    //    the already-open inode rather than the path string, so the rename lands in
-    //    the verified directory even if the path is repointed mid-command.
-    //
-    // A compressed mapping runs a decompression block, in the SAME `sh -c`
-    // script, immediately before its own fd-pinned promote block (C1–C3):
-    //  - `umask 077` + `set -C` (POSIX noclobber) scoped to a subshell, then
-    //    `exec 9> rawScratch` — an atomic exclusive create: `set -C` opens
-    //    with `O_CREAT|O_EXCL`, which fails on any EXISTING name, including a
-    //    symlink (dangling or not), because `O_EXCL` fails on the name's own
-    //    lstat and never opens through it. The tests in this package verify
-    //    this for the shells and the platform under test; it is not a claim
-    //    of a portable `O_NOFOLLOW` guarantee across every POSIX shell. This
-    //    is the retained descriptor C1 requires — never a separate
-    //    existence/symlink test.
-    //  - `zstd -d -c` writes into that retained descriptor (`>&9`), so the
-    //    decompressed bytes land in the pinned inode even if the pathname is
-    //    fought over mid-command.
-    //  - the mapping's `mode`, if set, is applied through `/proc/self/fd/9`
-    //    (the still-open descriptor) — never by reopening the pathname —
-    //    before the descriptor closes (C3). `umask 077` also means a mapping
-    //    with NO explicit mode still never appears wider than `0600` in the
-    //    window between create and the (absent) chmod.
-    //  - a subshell failure at any step exits non-zero without reaching the
-    //    `mv` (C2); the decompressed name is a reserved DIRECT child of
-    //    `remoteDir`, matching the guarantee the raw path already has for its
-    //    scratch name.
-    // Only after the decompression block succeeds does the existing fd-pinned
-    // promote block run — unchanged — for every mapping, compressed or raw.
-    const renameScript = [...canonicalizerPreamble(shellQuote(remoteDir))];
+    // Promote every mapping onto its final target with one `mv -f` per mapping,
+    // atomic on the shared workspace filesystem. A compressed mapping first
+    // decompresses its `.zst` scratch to the raw scratch name with `zstd -d -o`,
+    // applies the mapping's mode (if set) with `chmod`, then removes the `.zst`
+    // scratch after the `mv -f` promotes the raw scratch.
+    const renameScript: string[] = [];
     for (const plan of plans) {
-      const parentDir = plan.dir;
-      const base = path.posix.basename(plan.mapping.targetPath);
       if (plan.compressed) {
-        const modeCommand =
-          typeof plan.mapping.mode === "number"
-            ? `chmod ${toOctalModeString(plan.mapping.mode)} /proc/self/fd/9 || { echo "chmod failed"; exit 50; };`
-            : "";
+        // `zstd -d -o` copies the mode of its INPUT (the uploaded `.zst`
+        // scratch) onto its output with its own `chmod` call. That call runs
+        // AFTER creation, so it overrides any `umask` in effect — a mapping
+        // with no explicit `mode` must not rely on the scratch file's mode
+        // being owner-only already. Always `chmod` the decompressed file
+        // right after decompression: to the mapping's `mode` when set, or to
+        // owner-only (0600) otherwise. The pre-refactor decompression step
+        // applied the same 0600 default. The raw (uncompressed) path above
+        // applies no `chmod` when the mapping sets no `mode`, so the two
+        // inbound branches do not use the same no-mode default today.
+        const targetMode = typeof plan.mapping.mode === "number" ? plan.mapping.mode : 0o600;
         renameScript.push(
-          "(",
-          "umask 077;",
-          "set -C;",
-          `exec 9> ${shellQuote(plan.rawScratch)} || { echo "raw scratch create failed"; exit 48; };`,
-          `zstd -d -c -- ${shellQuote(plan.compressed.zstdScratch)} >&9 || { echo "decompress failed"; exit 49; };`,
-          modeCommand,
-          "exec 9>&-;",
-          ") || exit $?;",
+          `zstd -d -o ${shellQuote(plan.rawScratch)} ${shellQuote(plan.compressed.zstdScratch)} || { echo "decompress failed"; exit 49; };`,
+          `chmod ${toOctalModeString(targetMode)} ${shellQuote(plan.rawScratch)} || { echo "chmod failed"; exit 50; };`,
         );
       }
       renameScript.push(
-        `_pc_tgt_dir=$(_pc_resolve ${shellQuote(parentDir)}) || { echo "ESCAPE"; exit 42; };`,
-        `case "$_pc_tgt_dir/" in "$_pc_root"/*) : ;; *) echo "ESCAPE"; exit 42 ;; esac;`,
-        `exec 8<"$_pc_tgt_dir" || { echo "open failed"; exit 47; };`,
-        `_pc_fd_dir=$(_pc_resolve /proc/self/fd/8) || { echo "ESCAPE"; exit 42; };`,
-        `case "$_pc_fd_dir/" in "$_pc_root"/*) : ;; *) echo "ESCAPE"; exit 42 ;; esac;`,
-        `mv -f ${shellQuote(plan.rawScratch)} /proc/self/fd/8/${shellQuote(base)} || { echo "rename failed"; exit 43; };`,
-        `exec 8>&-;`,
+        `mv -f ${shellQuote(plan.rawScratch)} ${shellQuote(plan.mapping.targetPath)} || { echo "rename failed"; exit 43; };`,
       );
       if (plan.compressed) {
-        // Clean up the `.zst` scratch after a successful promotion (C2/step 7).
-        // `|| true` keeps a cleanup failure from becoming the promote script's
-        // own exit status — every target file is already in place by this
-        // point, so a stray `.zst` scratch must never read back as a sync
-        // failure.
+        // Clean up the `.zst` scratch after a successful promotion. `|| true`
+        // keeps a cleanup failure from becoming the promote script's own exit
+        // status — every target file is already in place by this point, so a
+        // stray `.zst` scratch must never read back as a sync failure.
         renameScript.push(`rm -f ${shellQuote(plan.compressed.zstdScratch)} || true;`);
       }
     }
-    // `promote` span: atomically move the staged temp onto its target via a
-    // pinned dir handle. When this batch decompressed at least one mapping,
-    // this span also carries `transfer.decompress.wall_ms`. That value
-    // measures the WHOLE promote command — the canonicalizer preamble, every
-    // decompression, and every `mv` — not decompression alone. Treat it as an
-    // upper bound on the decompress wall time, not an exact measurement.
+    // `promote` span: move the staged temp onto its target. When this batch
+    // decompressed at least one mapping, this span also carries
+    // `transfer.decompress.wall_ms`. That value measures the WHOLE promote
+    // command — every decompression and every `mv` — not decompression alone.
+    // Treat it as an upper bound on the decompress wall time, not an exact
+    // measurement.
     await withProviderSpan({
       name: "promote",
       wallMsAttr: hasCompressedMapping ? SPAN_ATTR.transferDecompressWallMs : undefined,
@@ -919,9 +959,8 @@ async function syncInDirectoryMapping(input: {
   timeoutSeconds: number;
 }): Promise<{ filesTransferred: number; bytesTransferred: number }> {
   const { sandbox, mapping, remoteDir, timeoutSeconds } = input;
-  assertConfinedSandboxPath(remoteDir, mapping.targetPath, "target");
   return withHostTempDir(async (tmp) => {
-    const archivePath = path.join(tmp, "sync-in.tar");
+    const archivePath = path.join(tmp, "sync-in.tar.gz");
     // The pack step is host-local: it builds the tarball and makes no sandbox
     // round trip. The `pack` span records its wall time.
     // `pack` span: build a tarball on the host — no sandbox round trip.
@@ -938,14 +977,12 @@ async function syncInDirectoryMapping(input: {
     const bytesTransferred = (await fs.stat(archivePath)).size;
     // The tar bytes ride the native bulk channel (string source ⇒ streamed);
     // only the extract/cleanup control commands use exec.
-    const remoteTar = path.posix.join(remoteDir, scratchName(".tar"));
+    const remoteTar = path.posix.join(remoteDir, scratchName(".tar.gz"));
     // Count the serial guard round trips before the transfer, so the transfer
     // span records how much of the wall time is guard cost.
     let guardRoundTrips = 0;
-    // Materialize the target dir first so the realpath guard resolves real
-    // components, then confirm it (and any existing parent) canonicalizes inside
-    // the remote dir — `tar -C` would otherwise follow a sandbox-planted symlink
-    // and extract our archive outside the workspace root.
+    // Materialize the target dir before the upload so the extract step below has
+    // somewhere to write.
     // `ensureDirectory` span: `mkdir -p` — ensure a directory exists before a write.
     await withProviderSpan({
       name: "ensureDirectory",
@@ -956,20 +993,6 @@ async function syncInDirectoryMapping(input: {
           timeoutSeconds,
           "syncIn mkdir",
         ),
-    });
-    guardRoundTrips += 1;
-    // `checkSymlinkEscape` span: re-check a path resolves inside the workspace
-    // root before use.
-    await withProviderSpan({
-      name: "checkSymlinkEscape",
-      run: () =>
-        assertSandboxPathsConfined({
-          sandbox,
-          remoteDir,
-          paths: [mapping.targetPath],
-          timeoutSeconds,
-          label: "inbound symlink-escape guard",
-        }),
     });
     guardRoundTrips += 1;
     // The uploaded scratch tar lands at the workspace root as a reserved
@@ -991,30 +1014,33 @@ async function syncInDirectoryMapping(input: {
         run: () =>
           sandbox.fs.uploadFiles([{ source: archivePath, destination: remoteTar }], timeoutSeconds),
       });
-      // Bind validation and extraction into ONE sandbox invocation, then extract into
-      // an OPEN directory inode rather than a path string. `exec 9<"$_pc_real"` itself
-      // walks every ancestor of `$_pc_real` during the `open()` syscall, so a sandbox
-      // process that swaps an ancestor component for a symlink AFTER `_pc_resolve`
-      // returns but BEFORE the `open()` resolves would leave fd 9 pointing at a
-      // directory outside the workspace — the earlier `case` check on the resolved
-      // string cannot see that. Close the gap with open-then-verify: open fd 9 (which
-      // PINS whatever inode `open()` landed on), then re-canonicalize `/proc/self/fd/9`
-      // — the pinned inode's own path — and confirm it is still inside `$_pc_root`
-      // before extracting. If an ancestor swap redirected the open, the pinned inode
-      // resolves outside the root and the verify fails closed (exit 42); once the
-      // verify passes, the inode is fixed and `tar -C /proc/self/fd/9` chdir's through
-      // the magic symlink to that exact inode, so a post-open ancestor swap cannot
-      // redirect the write. (The initial `case` on `$_pc_real` still fails fast on a
-      // pre-open escape; the fd re-verify is what makes the guarantee race-free.)
+      // Extract the uploaded tarball onto the already-created target directory,
+      // then remove the scratch tarball.
+      const immutable = mapping.mode !== undefined && (mapping.mode & 0o222) === 0;
       const extractScript = [
-        ...canonicalizerPreamble(shellQuote(remoteDir)),
-        `_pc_real=$(_pc_resolve ${shellQuote(mapping.targetPath)}) || { echo "ESCAPE"; exit 42; };`,
-        `case "$_pc_real/" in "$_pc_root"/*) : ;; *) echo "ESCAPE"; exit 42 ;; esac;`,
-        `exec 9<"$_pc_real" || { echo "open failed"; exit 46; };`,
-        `_pc_fd_real=$(_pc_resolve /proc/self/fd/9) || { echo "ESCAPE"; exit 42; };`,
-        `case "$_pc_fd_real/" in "$_pc_root"/*) : ;; *) echo "ESCAPE"; exit 42 ;; esac;`,
-        `tar -xf ${shellQuote(remoteTar)} -C /proc/self/fd/9 || { echo "extract failed"; exit 43; };`,
-        `exec 9>&-;`,
+        // A resumed sandbox can already contain these immutable 0444/0555
+        // assets. Repack a private extraction as the sandbox user: tar --diff
+        // otherwise rejects identical bytes because the host UID/GID differ.
+        // Compare content and modes, never chmod the live bundle or skip
+        // unverified old files. Extra user files in the target stay untouched.
+        ...(immutable ? [
+          `compare_dir=${shellQuote(`${remoteTar}.compare`)};`,
+          `compare_tar=${shellQuote(`${remoteTar}.normalized`)};`,
+          `compare_list=${shellQuote(`${remoteTar}.members`)};`,
+          'cleanup_compare() { if [ -d "$compare_dir" ]; then find "$compare_dir" -type d -exec chmod u+w {} +; rm -rf "$compare_dir"; fi; rm -f "$compare_tar" "$compare_list"; };',
+          "trap cleanup_compare EXIT;",
+          'mkdir -m 700 "$compare_dir" || exit 43;',
+          `tar -xf ${shellQuote(remoteTar)} --no-same-owner --delay-directory-restore -C "$compare_dir" || exit 43;`,
+          '(cd "$compare_dir" && find . -mindepth 1 -maxdepth 1 -print0) > "$compare_list" || exit 43;',
+          'tar -cf "$compare_tar" --format=pax -C "$compare_dir" --null -T "$compare_list" || exit 43;',
+          `if tar -df "$compare_tar" -C ${shellQuote(mapping.targetPath)} >/dev/null 2>&1; then rm -f ${shellQuote(remoteTar)}; exit 0; fi;`,
+          "cleanup_compare;",
+          "trap - EXIT;",
+        ] : []),
+        // BSD archives may revisit a directory after its parent's files. Keep
+        // GNU tar from restoring a read-only skill directory's mode before all
+        // of its children are extracted; final permissions remain unchanged.
+        `tar -xf ${shellQuote(remoteTar)} --delay-directory-restore -C ${shellQuote(mapping.targetPath)} || { echo "extract failed"; exit 43; };`,
         `rm -f ${shellQuote(remoteTar)};`,
       ].join("\n");
       // `extractTarball` span: one round trip — re-check the path, `tar -xf`, and
@@ -1040,17 +1066,13 @@ async function syncInDirectoryMapping(input: {
 
 /**
  * Execute an operation's ordered `postUploadCommands` in-sandbox AFTER its files
- * have landed (Phase 3 / Security Conditions C1–C4). Commands run in array order,
- * fail-fast: the first non-zero exit or timeout throws and stops the rest — no
- * silent partial fallback (C4). Each `command` string is executed VERBATIM via the
- * exec seam; the provider never rewrites, concatenates, or appends a shell fragment
- * to it (C1/C3) — the working directory rides `executeCommand`'s structured `cwd`
- * argument, never a `cd &&` prefix on the command. Before exec, a present `cwd` is
- * re-validated under the workspace remote dir with the same lexical
- * ({@link assertConfinedSandboxPath}) + realpath/symlink ({@link assertSandboxPathsConfined})
- * guards used for file placement (C2): `..`, absolute-escape, and symlink-escape
- * are rejected fail-closed before any command runs. An absent `cwd` defaults to the
- * provider-resolved remote dir — never a process default cwd.
+ * have landed. Commands run in array order, fail-fast: the first non-zero exit
+ * or timeout throws and stops the rest. Each `command` string is executed
+ * VERBATIM via the exec seam; the provider never rewrites, concatenates, or
+ * appends a shell fragment to it — the working directory rides
+ * `executeCommand`'s structured `cwd` argument, never a `cd &&` prefix on the
+ * command. An absent `cwd` defaults to the provider-resolved remote dir — never
+ * a process default cwd.
  *
  * Shared by the file- and directory-mapping paths: it runs once per operation,
  * after every mapping of that operation has been placed.
@@ -1063,29 +1085,10 @@ async function runPostUploadCommands(input: {
 }): Promise<void> {
   const { sandbox, commands, remoteDir, timeoutSeconds } = input;
   for (const command of commands) {
-    // C2: re-confine the command cwd before exec. Absent → the remote dir (never a
-    // process default cwd); the remote dir is the confinement root itself, so only
-    // an explicit cwd carries untrusted input worth re-validating.
-    let cwd = remoteDir;
-    if (command.cwd != null) {
-      assertConfinedSandboxPath(remoteDir, command.cwd, "post-upload command cwd");
-      // `checkSymlinkEscape` span: re-check a path resolves inside the workspace
-      // root before use.
-      await withProviderSpan({
-        name: "checkSymlinkEscape",
-        run: () =>
-          assertSandboxPathsConfined({
-            sandbox,
-            remoteDir,
-            paths: [command.cwd as string],
-            timeoutSeconds,
-            label: "post-upload command cwd symlink-escape guard",
-          }),
-      });
-      cwd = command.cwd;
-    }
-    // C1/C3: run the command VERBATIM with a structured cwd (no string rewrite).
-    // C4: first non-zero exit or timeout throws and aborts the remaining commands.
+    // Absent cwd defaults to the remote dir, never a process default cwd.
+    const cwd = command.cwd ?? remoteDir;
+    // Run the command VERBATIM with a structured cwd (no string rewrite). The
+    // first non-zero exit or timeout throws and aborts the remaining commands.
     const commandTimeoutSeconds =
       command.timeoutMs != null ? toTimeoutSeconds(command.timeoutMs) : timeoutSeconds;
     // `postUploadCommand` span: run one caller-supplied post-upload command.
@@ -1138,8 +1141,7 @@ export async function performSyncIn(input: {
     }
 
     // Run the operation's ordered post-upload commands AFTER every file/directory
-    // mapping of this operation has landed (Phase 3 / C1–C4). Absent/empty → no
-    // extra exec, byte-identical to a pre-contract operation.
+    // mapping of this operation has landed. Absent/empty → no extra exec.
     await runPostUploadCommands({
       sandbox: input.sandbox,
       commands: operation.postUploadCommands ?? [],
@@ -1165,17 +1167,14 @@ async function syncOutFileMappings(input: {
   const { sandbox, mappings, remoteDir, timeoutSeconds } = input;
   if (mappings.length === 0) return { filesTransferred: 0, bytesTransferred: 0 };
 
-  for (const mapping of mappings) {
-    assertConfinedSandboxPath(remoteDir, mapping.sourcePath, "source");
-  }
   // Close the validation→download TOCTOU: instead of re-opening each mutable
   // source, validate-and-snapshot it in one atomic sandbox-side step and download
   // the immutable snapshot. `snapshots` is index-aligned with `mappings`.
-  const snapshots = await snapshotOutboundFileSources({
-    sandbox,
-    remoteDir,
-    sources: mappings.map((mapping) => mapping.sourcePath),
-    timeoutSeconds,
+  const snapshots = await withEnvironmentSyncTransferStep("sandbox_guard", async () => {
+    for (const mapping of mappings) assertConfinedSandboxPath(remoteDir, mapping.sourcePath, "source");
+    return snapshotOutboundFileSources({
+      sandbox, remoteDir, sources: mappings.map((mapping) => mapping.sourcePath), timeoutSeconds,
+    });
   });
 
   const requests: FileDownloadRequest[] = [];
@@ -1201,6 +1200,7 @@ async function syncOutFileMappings(input: {
       await fs.mkdir(path.dirname(entry.target), { recursive: true });
     }
   } catch (error) {
+    recordEnvironmentSyncError(error, { transferStep: "file_finalize" });
     await cleanup();
     throw error;
   }
@@ -1215,7 +1215,7 @@ async function syncOutFileMappings(input: {
   try {
     // One batched bulk download for all file mappings, reading the snapshots.
     // `transfer` span: the real byte download — `sandbox.fs.downloadFiles`.
-    responses = await withProviderSpan({
+    responses = await withEnvironmentSyncTransferStep("file_download", () => withProviderSpan({
       name: "transfer",
       wallMsAttr: SPAN_ATTR.transferWallMs,
       attributes: {
@@ -1223,7 +1223,7 @@ async function syncOutFileMappings(input: {
         [SPAN_ATTR.transferDirection]: "outbound",
       },
       run: () => sandbox.fs.downloadFiles(requests, timeoutSeconds),
-    });
+    }));
   } catch (error) {
     await cleanup();
     throw error;
@@ -1237,9 +1237,9 @@ async function syncOutFileMappings(input: {
     const response = bySource.get(entry.snapshot);
     if (!response || response.error) {
       await cleanup();
-      throw new Error(
+      throw recordEnvironmentSyncError(new Error(
         `Daytona syncOut download failed for ${entry.source}: ${response?.error ?? "no response returned"}`,
-      );
+      ), { transferStep: "file_download", transferFailureKind: response ? "download_failed" : "download_missing" });
     }
   }
 
@@ -1255,6 +1255,7 @@ async function syncOutFileMappings(input: {
       await fs.rename(entry.temp, entry.target);
     }
   } catch (error) {
+    recordEnvironmentSyncError(error, { transferStep: "file_finalize" });
     await cleanup();
     throw error;
   }
@@ -1270,24 +1271,27 @@ async function syncOutDirectoryMapping(input: {
   mapping: PluginSyncFileMapping;
   remoteDir: string;
   timeoutSeconds: number;
+  onArchiveRecovery?: () => void;
 }): Promise<{ filesTransferred: number; bytesTransferred: number }> {
   const { sandbox, mapping, remoteDir, timeoutSeconds } = input;
-  assertConfinedSandboxPath(remoteDir, mapping.sourcePath, "source");
   // Count the serial sandbox round trips before the transfer, so the transfer
   // span records how much of the wall time is guard cost.
   let guardRoundTrips = 0;
-  await assertSandboxPathsConfined({
-    sandbox,
-    remoteDir,
-    paths: [mapping.sourcePath],
-    timeoutSeconds,
-    label: "outbound symlink-escape guard",
+  await withEnvironmentSyncTransferStep("sandbox_guard", async () => {
+    assertConfinedSandboxPath(remoteDir, mapping.sourcePath, "source");
+    await assertSandboxPathsConfined({
+      sandbox, remoteDir, paths: [mapping.sourcePath], timeoutSeconds,
+      label: "outbound symlink-escape guard",
+    });
   });
   guardRoundTrips += 1;
 
   return withHostTempDir(async (tmp) => {
     const remoteTar = path.posix.join(remoteDir, scratchName(".tar"));
-    const excludeFlags = ["._*", ...(mapping.exclude ?? [])]
+    const remoteList = path.posix.join(remoteDir, scratchName(".list"));
+    const excludes = ["._*", `${SCRATCH_PREFIX}*`, ...(mapping.exclude ?? [])];
+    const excludeFlags = excludes
+      .flatMap((entry) => [entry, `${entry.replace(/\/$/, "")}/*`])
       .map((entry) => `--exclude ${shellQuote(entry)}`)
       .join(" ");
     // Tar the source in-sandbox (naming top-level entries so no "." self-entry is
@@ -1301,37 +1305,67 @@ async function syncOutDirectoryMapping(input: {
       `if [ "$#" -eq 0 ]; then dd if=/dev/zero of=${shellQuote(remoteTar)} bs=1024 count=1; ` +
         `else tar -c --no-xattrs ${mapping.followSymlinks ? "-h " : ""}${excludeFlags} -f ${shellQuote(remoteTar)} -- "$@"; fi`,
     ].join(" && ");
-    await assertSandboxCommandOk(sandbox, `sh -c ${shellQuote(tarScript)}`, timeoutSeconds, "syncOut tar");
-    guardRoundTrips += 1;
+    // Rebuild the archive with files, directories, and relative links whose
+    // resolved targets remain inside this mapping. Nothing is deleted or
+    // dereferenced. Host validation still checks the rebuilt archive, including
+    // links changed by the sandbox between enumeration and tar creation.
+    const prunePaths = excludes.flatMap((entry) => [
+      `-path ${shellQuote(`./${entry}`)}`, `-path ${shellQuote(`*/${entry}`)}`,
+    ]).join(" -o ");
+    const filterLinks = [
+      ...canonicalizerPreamble(shellQuote(mapping.sourcePath)),
+      'for _pc_link do',
+      '  _pc_target=$(readlink -- "$_pc_link") || continue;',
+      '  case "$_pc_link" in *" -> "*) continue ;; esac;',
+      '  case "$_pc_target" in /*|*" -> "*) continue ;; esac;',
+      '  _pc_real=$(_pc_resolve "$_pc_link" 2>/dev/null) || continue;',
+      `  case "$_pc_real/" in "$_pc_root"/*) printf '%s\\0' "$_pc_link" ;; esac;`,
+      'done',
+    ].join("\n");
+    const confinedEntriesScript = [
+      `cd ${shellQuote(mapping.sourcePath)}`,
+      `find . -mindepth 1 \\( ${prunePaths} \\) -prune -o -type l -exec sh -c ${shellQuote(filterLinks)} sh {} + -o \\( -type f -o -type d \\) -print0 > ${shellQuote(remoteList)}`,
+      `tar -c --no-xattrs --hard-dereference --no-recursion --null ${excludeFlags} -f ${shellQuote(remoteTar)} -T ${shellQuote(remoteList)}`,
+    ].join(" && ");
 
     const localTar = path.join(tmp, "sync-out.tar");
     let bytesTransferred = 0;
     try {
-      // `transfer` span: the real byte download — `sandbox.fs.downloadFiles`.
-      const responses = await withProviderSpan({
-        name: "transfer",
-        wallMsAttr: SPAN_ATTR.transferWallMs,
-        attributes: {
-          [SPAN_ATTR.transferGuardCount]: guardRoundTrips,
-          [SPAN_ATTR.transferDirection]: "outbound",
-        },
-        run: () =>
-          sandbox.fs.downloadFiles([{ source: remoteTar, destination: localTar }], timeoutSeconds),
-      });
-      const response = responses.find((entry) => entry.source === remoteTar) ?? responses[0];
-      if (!response || response.error) {
-        throw new Error(
-          `Daytona syncOut directory download failed for ${mapping.sourcePath}: ${response?.error ?? "no response returned"}`,
-        );
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        await withEnvironmentSyncTransferStep("archive_create", () =>
+          assertSandboxCommandOk(sandbox, `sh -c ${shellQuote(attempt === 0 ? tarScript : confinedEntriesScript)}`, timeoutSeconds, "syncOut tar"));
+        guardRoundTrips += 1;
+        // `transfer` span: the real byte download — `sandbox.fs.downloadFiles`.
+        const responses = await withEnvironmentSyncTransferStep("archive_download", () => withProviderSpan({
+          name: "transfer",
+          wallMsAttr: SPAN_ATTR.transferWallMs,
+          attributes: {
+            [SPAN_ATTR.transferGuardCount]: guardRoundTrips,
+            [SPAN_ATTR.transferDirection]: "outbound",
+          },
+          run: () =>
+            sandbox.fs.downloadFiles([{ source: remoteTar, destination: localTar }], timeoutSeconds),
+        }));
+        const response = responses.find((entry) => entry.source === remoteTar) ?? responses[0];
+        if (!response || response.error) {
+          throw recordEnvironmentSyncError(new Error(
+            `Daytona syncOut directory download failed for ${mapping.sourcePath}: ${response?.error ?? "no response returned"}`,
+          ), { transferStep: "archive_download", transferFailureKind: response ? "download_failed" : "download_missing" });
+        }
+        bytesTransferred += await withEnvironmentSyncTransferStep("archive_download", async () => (await fs.stat(localTar)).size);
+        try {
+          await extractHostTarball({ archivePath: localTar, localDir: mapping.targetPath });
+          break;
+        } catch (error) {
+          if (!(error instanceof UnsafeOutboundArchiveError) || attempt > 0) throw error;
+          // Diagnostic only: no warning, task action, or additional agent turn.
+          try { input.onArchiveRecovery?.(); } catch { /* logging is best effort */ }
+        }
       }
-      bytesTransferred = (await fs.stat(localTar)).size;
-      await extractHostTarball({ archivePath: localTar, localDir: mapping.targetPath });
     } finally {
       // Best-effort remove the sandbox-side scratch tar; the host temp dir is
       // cleaned by withHostTempDir.
-      await sandbox.fs
-        .deleteFile(remoteTar)
-        .catch(() => undefined);
+      await Promise.all([remoteTar, remoteList].map((file) => sandbox.fs.deleteFile(file).catch(() => undefined)));
     }
     const filesTransferred = await countHostFiles(mapping.targetPath, mapping.exclude);
     return { filesTransferred, bytesTransferred };
@@ -1343,6 +1377,7 @@ export async function performSyncOut(input: {
   operations: PluginSyncOperation[];
   remoteDir: string;
   timeoutSeconds: number;
+  onArchiveRecovery?: () => void;
 }): Promise<PluginEnvironmentSyncResult> {
   const operations: PluginEnvironmentSyncResult["operations"] = [];
   for (const operation of input.operations) {
@@ -1365,6 +1400,7 @@ export async function performSyncOut(input: {
       const dirResult = await syncOutDirectoryMapping({
         sandbox: input.sandbox,
         mapping,
+        onArchiveRecovery: input.onArchiveRecovery,
         remoteDir: input.remoteDir,
         timeoutSeconds: input.timeoutSeconds,
       });

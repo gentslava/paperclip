@@ -11,6 +11,7 @@ import {
   RotateCcw,
   Trash2,
   CheckCircle2,
+  Bug,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -161,6 +162,7 @@ export function AgentActionButtons({
   assignLabel = "Assign Task",
   runLabel = "Run now",
   showStatus = true,
+  showRun = true,
   actionsDisabled = false,
   workActionsDisabled = false,
   workActionsDisabledReason,
@@ -180,6 +182,7 @@ export function AgentActionButtons({
   assignLabel?: string;
   runLabel?: string;
   showStatus?: boolean;
+  showRun?: boolean;
   actionsDisabled?: boolean;
   workActionsDisabled?: boolean;
   workActionsDisabledReason?: string;
@@ -235,7 +238,7 @@ export function AgentActionButtons({
 
   const resolvedCompanyId = companyId ?? agent.companyId;
   const canonicalAgentRef = agentRouteRef(agent);
-  const isPaused = agent.status === "paused";
+  const isPaused = agent.lifecycleState ? agent.lifecycleState === "paused" : agent.status === "paused";
   const isError = agent.status === "error";
 
   const reportError = useCallback(
@@ -276,6 +279,8 @@ export function AgentActionButtons({
       onActionError?.(null);
       invalidateAgent();
       if (action === "terminate") {
+        const state = (data as Agent).lifecycleState;
+        if (state === "terminating" || state === "cleaning_up") return;
         if (!confirmLateNavigationChanges(agentActionStartedDirtyRef)) return;
         onTerminateSuccess?.(data as Agent);
       }
@@ -345,12 +350,28 @@ export function AgentActionButtons({
 
   const isPendingApproval = agent.status === "pending_approval";
   const disabled = actionsDisabled || agentAction.isPending;
-  const assignAndRunDisabled = disabled || isPendingApproval || workActionsDisabled;
-  const pauseResumeDisabled = disabled || isPendingApproval || (isPaused && workActionsDisabled);
+  const assignAndRunDisabled = disabled || isPendingApproval || workActionsDisabled || agent.status === "terminated";
+  const pauseResumeDisabled = disabled || isPendingApproval || (isPaused && workActionsDisabled)
+    || Boolean(agent.lifecycleState && ["pausing", "terminating", "cleaning_up", "terminated", "rejected"].includes(agent.lifecycleState));
   const clearErrorDisabled = disabled;
+  const runtimeConfig = agent.runtimeConfig as Record<string, unknown> | null;
+  const runtimeDebug =
+    runtimeConfig && typeof runtimeConfig.debug === "object" && runtimeConfig.debug !== null
+      ? (runtimeConfig.debug as Record<string, unknown>)
+      : null;
+  const persistentProviderTrace = runtimeDebug?.providerTrace === "raw";
 
   return (
     <div className={className ?? "flex items-center gap-1 sm:gap-2 shrink-0"}>
+      {persistentProviderTrace ? (
+        <span
+          className="hidden items-center gap-1 rounded-md border border-primary/30 bg-primary/10 px-2 py-1 text-xs font-medium text-primary lg:inline-flex"
+          title="Exact provider traffic will be captured for future runs and retained for up to 24 hours."
+        >
+          <Bug className="h-3.5 w-3.5" />
+          Raw tracing on
+        </span>
+      ) : null}
       <Button
         variant="outline"
         size={size}
@@ -361,7 +382,7 @@ export function AgentActionButtons({
         <Plus className="h-3.5 w-3.5 sm:mr-1" />
         <span className="hidden sm:inline">{assignLabel}</span>
       </Button>
-      <RunButton
+      {showRun && <RunButton
         onClick={() => {
           if (navigateToRunOnInvoke && !confirmNavigationStart(agentActionStartedDirtyRef)) return;
           agentAction.mutate("invoke");
@@ -369,13 +390,19 @@ export function AgentActionButtons({
         disabled={assignAndRunDisabled}
         label={runLabel}
         size={size}
-      />
+      />}
       {isError ? (
         <ClearErrorButton
           onClick={() => agentAction.mutate("clear_error")}
           disabled={clearErrorDisabled}
           size={size}
         />
+      ) : agent.pauseReason === "setup" && agent.lifecycleState === "paused" ? (
+        <Button variant="outline" size={size} disabled={disabled} onClick={() => navigate(`/agents/new?${new URLSearchParams({
+          name: agent.name, adapterType: agent.adapterType, setupAgentId: agent.id,
+          runnerProvider: String(agent.adapterConfig.provider === "acpx" ? agent.adapterConfig.acpxAgent : agent.adapterConfig.provider ?? "codex"),
+          ...(agent.adapterType === "paperclip_runner" ? { runner: "paperclip" } : ["codex_local", "claude_local", "opencode_local", "pi_local"].includes(agent.adapterType) ? { runner: "legacy" } : {}),
+        })}`)}>Finish setup</Button>
       ) : (
         <PauseResumeButton
           isPaused={isPaused}

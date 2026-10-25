@@ -12,19 +12,14 @@ function interaction(overrides: Record<string, unknown> = {}) {
     createdByUserId: null,
     sourceRunId: "run-1",
     addresseeAgentId: null,
+    addresseeUserId: null,
     effectiveResolverPolicy: "anyone",
     ...overrides,
   };
 }
 
 describe("issue-thread interaction resolver audience", () => {
-  it.each([
-    "suggest_tasks",
-    "ask_user_questions",
-    "request_confirmation",
-    "request_checkbox_confirmation",
-    "request_item_verdicts",
-  ])("allows the creator and creating run under anyone for %s", () => {
+  it("allows the creator and creating run under anyone", () => {
     expect(evaluateIssueThreadInteractionResolverAudience({
       actor: agent,
       interaction: interaction(),
@@ -48,6 +43,18 @@ describe("issue-thread interaction resolver audience", () => {
       interaction: interaction({ addresseeAgentId: "agent-2" }),
     });
     expect(decision).toMatchObject({ allowed: false, code: "interaction_addressee_mismatch" });
+  });
+
+  it("allows only the addressed user to resolve a user-addressed interaction", () => {
+    expect(evaluateIssueThreadInteractionResolverAudience({
+      actor: { type: "user", userId: "alice" },
+      interaction: interaction({ addresseeUserId: "alice", effectiveResolverPolicy: "human_only" }),
+    })).toMatchObject({ allowed: true, reason: "allow_addressee" });
+
+    expect(evaluateIssueThreadInteractionResolverAudience({
+      actor: { type: "user", userId: "bob" },
+      interaction: interaction({ addresseeUserId: "alice", effectiveResolverPolicy: "human_only" }),
+    })).toMatchObject({ allowed: false, code: "interaction_addressee_mismatch" });
   });
 
   it("requires run attribution for agents", () => {

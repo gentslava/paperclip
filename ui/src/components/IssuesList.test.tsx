@@ -13,6 +13,8 @@ import {
   issueAgeSeparatorLabel,
 } from "./IssuesList";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { useShowAgentCreatedTasks } from "../hooks/useShowAgentCreatedTasks";
+import { taskCollectionPreferencesStorageKey } from "../lib/task-collection-preferences";
 
 const companyState = vi.hoisted(() => ({
   selectedCompanyId: "company-1",
@@ -23,11 +25,14 @@ const dialogState = vi.hoisted(() => ({
 }));
 
 const mockIssuesApi = vi.hoisted(() => ({
+  get: vi.fn(),
+  listAll: vi.fn(),
   list: vi.fn(),
   listLabels: vi.fn(),
 }));
 
 const mockKanbanBoard = vi.hoisted(() => vi.fn());
+const mockNavigate = vi.hoisted(() => vi.fn());
 
 const mockAuthApi = vi.hoisted(() => ({
   getSession: vi.fn(),
@@ -61,7 +66,7 @@ vi.mock("../context/DialogContext", () => ({
 }));
 
 vi.mock("@/lib/router", () => ({
-  useNavigate: () => vi.fn(),
+  useNavigate: () => mockNavigate,
   Link: ({
     children,
     to,
@@ -130,6 +135,11 @@ vi.mock("./IssueRow", () => ({
     checklistDependencyChips,
     checklistRowId,
     externalObjectSummary,
+    presentation,
+    leadingControl,
+    treeGuides,
+    showIdentifier,
+    trailingMeta,
   }: {
     issue: Issue;
     desktopMetaLeading?: ReactNode;
@@ -140,20 +150,32 @@ vi.mock("./IssueRow", () => ({
     checklistDependencyChips?: ReactNode;
     checklistRowId?: string;
     externalObjectSummary?: { total: number } | null;
+    presentation?: "legacy" | "task";
+    leadingControl?: ReactNode;
+    treeGuides?: number;
+    showIdentifier?: boolean;
+    trailingMeta?: ReactNode;
   }) => (
     <div
       data-testid="issue-row"
+      data-presentation={presentation}
+      data-tree-guides={treeGuides ?? 0}
+      data-show-identifier={showIdentifier ? "true" : "false"}
+      data-trailing-meta={typeof trailingMeta === "string" ? trailingMeta : undefined}
+      data-has-desktop-trailing={desktopTrailing ? "true" : "false"}
       id={checklistRowId}
       data-step={checklistStepNumber ?? undefined}
       data-current-step={checklistCurrentStep ? "true" : undefined}
       data-title-class={titleClassName ?? undefined}
     >
       <span>{issue.title}</span>
+      {leadingControl}
       {externalObjectSummary ? (
         <span data-testid="external-object-summary">{externalObjectSummary.total}</span>
       ) : null}
       {desktopMetaLeading}
       {desktopTrailing}
+      {trailingMeta}
       {checklistDependencyChips}
     </div>
   ),
@@ -203,7 +225,7 @@ function createIssue(overrides: Partial<Issue> = {}): Issue {
     assigneeUserId: null,
     responsibleUserId: null,
     createdByAgentId: null,
-    createdByUserId: null,
+    createdByUserId: "person",
     issueNumber: 1,
     requestDepth: 0,
     billingCode: null,
@@ -324,6 +346,7 @@ describe("IssuesList", () => {
     document.body.appendChild(container);
     dialogState.openNewIssue.mockReset();
     mockKanbanBoard.mockReset();
+    mockNavigate.mockReset();
     mockIssuesApi.list.mockReset();
     mockIssuesApi.listLabels.mockReset();
     mockAuthApi.getSession.mockReset();
@@ -334,6 +357,7 @@ describe("IssuesList", () => {
     mockInstanceSettingsApi.getExperimental.mockReset();
     mockExternalObjectsApi.getIssueSummaries.mockReset();
     mockIssuesApi.list.mockResolvedValue([]);
+    mockIssuesApi.listAll.mockResolvedValue([]);
     mockIssuesApi.listLabels.mockResolvedValue([]);
     mockAuthApi.getSession.mockResolvedValue({ user: null, session: null });
     mockAccessApi.listMembers.mockResolvedValue({ members: [], access: {} });
@@ -343,6 +367,7 @@ describe("IssuesList", () => {
     mockInstanceSettingsApi.getExperimental.mockResolvedValue({
       enableIsolatedWorkspaces: false,
       enableExternalObjects: false,
+      enableStreamlinedUi: true,
     });
     setDocumentScrollMetrics({ innerHeight: 600, scrollY: 0, scrollHeight: 2400 });
     mockExternalObjectsApi.getIssueSummaries.mockResolvedValue({ summaries: {} });
@@ -352,6 +377,50 @@ describe("IssuesList", () => {
   afterEach(() => {
     vi.useRealTimers();
     container.remove();
+  });
+
+  it("uses the master list and legacy persistence when Streamlined UI is off", async () => {
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({
+      enableIsolatedWorkspaces: false,
+      enableExternalObjects: false,
+      enableStreamlinedUi: false,
+    });
+    localStorage.setItem(
+      taskCollectionPreferencesStorageKey({
+        companyId: "company-1",
+        collectionKey: "paperclip:test-issues",
+      }),
+      JSON.stringify({
+        version: 1,
+        companyId: "company-1",
+        collectionKey: "paperclip:test-issues",
+        viewState: { viewMode: "board" },
+        columns: [],
+      }),
+    );
+
+    const { root } = renderWithQueryClient(
+      <IssuesList
+        issues={[createIssue({ id: "legacy-issue", title: "Master task row" })]}
+        isLoading={false}
+        agents={[]}
+        projects={[]}
+        viewStateKey="paperclip:test-issues"
+        rowPresentation="task"
+        toolbarPresentation="collection"
+        onUpdateIssue={() => undefined}
+      />,
+      container,
+    );
+
+    await waitForAssertion(() => {
+      const row = container.querySelector("[data-testid='issue-row']");
+      expect(row).not.toBeNull();
+      expect(row?.getAttribute("data-presentation")).toBeNull();
+      expect(container.querySelector("[data-testid='kanban-board']")).toBeNull();
+    });
+
+    act(() => root.unmount());
   });
 
   it("forwards external-object summaries into issue rows", async () => {
@@ -380,6 +449,7 @@ describe("IssuesList", () => {
         agents={[]}
         projects={[]}
         viewStateKey="paperclip:test-issues"
+        rowPresentation="task"
         onUpdateIssue={() => undefined}
       />,
       container,
@@ -395,6 +465,80 @@ describe("IssuesList", () => {
     });
   });
 
+  it("keeps the canonical task-row presentation opt in per collection", async () => {
+    const { root } = renderWithQueryClient(
+      <IssuesList
+        issues={[createIssue()]}
+        agents={[]}
+        projects={[]}
+        viewStateKey="paperclip:test-issues"
+        rowPresentation="task"
+        onUpdateIssue={() => undefined}
+      />,
+      container,
+    );
+
+    await waitForAssertion(() => {
+      const row = container.querySelector("[data-testid='issue-row']");
+      expect(row?.getAttribute("data-presentation")).toBe("task");
+      expect(row?.getAttribute("data-show-identifier")).toBe("true");
+      expect(row?.getAttribute("data-trailing-meta")).toMatch(/\S/);
+      expect(row?.getAttribute("data-trailing-meta")).not.toContain("Updated");
+      expect(row?.getAttribute("data-has-desktop-trailing")).toBe("false");
+      expect(row?.querySelector('[data-slot="task-row-disclosure-spacer"]')).not.toBeNull();
+    });
+
+    act(() => root.unmount());
+  });
+
+  it("reserves a disclosure column after each ancestor guide in canonical task trees", async () => {
+    const parent = createIssue({ id: "parent", identifier: "PAP-1", title: "Parent task" });
+    const child = createIssue({ id: "child", identifier: "PAP-2", parentId: parent.id, title: "Child task" });
+    const { root } = renderWithQueryClient(
+      <IssuesList
+        issues={[parent, child]}
+        agents={[]}
+        projects={[]}
+        viewStateKey="paperclip:test-issues"
+        rowPresentation="task"
+        onUpdateIssue={() => undefined}
+      />,
+      container,
+    );
+
+    await waitForAssertion(() => {
+      const rows = Array.from(container.querySelectorAll('[data-testid="issue-row"]'));
+      const parentRow = rows.find((row) => row.textContent?.includes("Parent task"));
+      const childRow = rows.find((row) => row.textContent?.includes("Child task"));
+      expect(parentRow?.getAttribute("data-tree-guides")).toBe("0");
+      expect(parentRow?.querySelector('button[aria-label="Collapse sub-tasks"]')).not.toBeNull();
+      expect(childRow?.getAttribute("data-tree-guides")).toBe("1");
+      expect(childRow?.querySelector('[data-slot="task-row-disclosure-spacer"]')).not.toBeNull();
+    });
+
+    act(() => root.unmount());
+  });
+
+  it("keeps the shared collection toolbar opt in per surface", async () => {
+    const { root } = renderWithQueryClient(
+      <IssuesList
+        issues={[createIssue()]}
+        agents={[]}
+        projects={[]}
+        viewStateKey="paperclip:test-issues"
+        toolbarPresentation="collection"
+        onUpdateIssue={() => undefined}
+      />,
+      container,
+    );
+
+    await waitForAssertion(() => {
+      expect(container.querySelector("[role='toolbar'][aria-label='Task controls']")).not.toBeNull();
+    });
+
+    act(() => root.unmount());
+  });
+
   it("does not load external-object summaries when the experimental flag is disabled", async () => {
     const { root } = renderWithQueryClient(
       <IssuesList
@@ -402,6 +546,7 @@ describe("IssuesList", () => {
         agents={[]}
         projects={[]}
         viewStateKey="paperclip:test-issues"
+        rowPresentation="task"
         onUpdateIssue={() => undefined}
       />,
       container,
@@ -458,6 +603,7 @@ describe("IssuesList", () => {
         agents={[]}
         projects={[]}
         viewStateKey="paperclip:test-issues"
+        rowPresentation="task"
         onUpdateIssue={() => undefined}
       />,
       container,
@@ -780,6 +926,7 @@ describe("IssuesList", () => {
         agents={[]}
         projects={[]}
         viewStateKey="paperclip:test-issues"
+        rowPresentation="task"
         onUpdateIssue={() => undefined}
       />,
       container,
@@ -1211,7 +1358,7 @@ describe("IssuesList", () => {
         agents={[]}
         projects={[]}
         viewStateKey="paperclip:test-issues"
-        enableRoutineVisibilityFilter
+        enableAgentCreatedVisibilityFilter
         onUpdateIssue={() => undefined}
       />,
       container,
@@ -1222,11 +1369,13 @@ describe("IssuesList", () => {
         status: "backlog",
         limit: 200,
         includeRoutineExecutions: true,
+        includeAgentCreatedTasks: false,
       }), { signal: expect.any(AbortSignal) });
       expect(mockIssuesApi.list).toHaveBeenCalledWith("company-1", expect.objectContaining({
         status: "done",
         limit: 200,
         includeRoutineExecutions: true,
+        includeAgentCreatedTasks: false,
       }), { signal: expect.any(AbortSignal) });
       expect(mockKanbanBoard).toHaveBeenLastCalledWith(expect.objectContaining({
         issues: expect.arrayContaining([
@@ -1416,6 +1565,48 @@ describe("IssuesList", () => {
     act(() => {
       root.unmount();
     });
+  });
+
+  it.each([true, false])("retains loaded context while revealing a large automated tree (streamlined=%s)", async (streamlined) => {
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableStreamlinedUi: streamlined });
+    const parent = createIssue({ id: "human-root", createdByUserId: "person", originKind: "manual" });
+    const children = Array.from({ length: 250 }, (_, index) => createIssue({
+      id: `automated-child-${index}`, title: `Automated child ${index}`,
+      parentId: parent.id, createdByUserId: null, createdByAgentId: "agent", originKind: "manual",
+    }));
+    let holdNextRead = false;
+    let releaseRead: (() => void) | undefined;
+    mockIssuesApi.list.mockImplementation(async (_companyId, filters) => {
+      if (filters.parentId !== parent.id) return [];
+      const rows = children.slice(filters.offset ?? 0, (filters.offset ?? 0) + filters.limit);
+      if (holdNextRead) {
+        holdNextRead = false;
+        return new Promise<Issue[]>((resolve) => { releaseRead = () => resolve(rows); });
+      }
+      return rows;
+    });
+    const { root } = renderWithQueryClient(
+      <IssuesList issues={[parent]} agents={[]} projects={[]} viewStateKey="paperclip:test-tree"
+        enableAgentCreatedVisibilityFilter onUpdateIssue={() => undefined} />,
+      container,
+    );
+    await waitForAssertion(() => expect(container.querySelectorAll("[data-testid='issue-row']")).toHaveLength(100));
+    holdNextRead = true;
+    act(() => {
+      setDocumentScrollMetrics({ innerHeight: 600, scrollY: 1500, scrollHeight: 2000 });
+      window.dispatchEvent(new Event("scroll"));
+    });
+    await flushAnimationFrame();
+    await waitForAssertion(() => {
+      expect(releaseRead).toBeDefined();
+      expect(container.querySelectorAll("[data-testid='issue-row']").length).toBeGreaterThanOrEqual(100);
+    });
+    await act(async () => releaseRead!());
+    await waitForAssertion(() => {
+      expect(container.querySelectorAll("[data-testid='issue-row']")).toHaveLength(251);
+      expect(container.textContent).toContain("Automated child 249");
+    }, 60);
+    act(() => root.unmount());
   });
 
   it("keeps rendering local issue batches while the user stays near the bottom", async () => {
@@ -1785,6 +1976,56 @@ describe("IssuesList", () => {
     });
   });
 
+  it("ignores a saved workspace filter when the page address has no workspace query", async () => {
+    localStorage.setItem(
+      taskCollectionPreferencesStorageKey({
+        companyId: "company-1",
+        collectionKey: "paperclip:test-issues",
+      }),
+      JSON.stringify({
+        version: 1,
+        companyId: "company-1",
+        collectionKey: "paperclip:test-issues",
+        viewState: {
+          workspaces: ["workspace-alpha"],
+        },
+        columns: ["id"],
+      }),
+    );
+    const alphaIssue = createIssue({
+      id: "issue-alpha",
+      identifier: "PAP-40",
+      title: "Alpha issue",
+      executionWorkspaceId: "workspace-alpha",
+    });
+    const betaIssue = createIssue({
+      id: "issue-beta",
+      identifier: "PAP-41",
+      title: "Beta issue",
+      executionWorkspaceId: "workspace-beta",
+    });
+
+    const { root } = renderWithQueryClient(
+      <IssuesList
+        issues={[alphaIssue, betaIssue]}
+        agents={[]}
+        projects={[]}
+        viewStateKey="paperclip:test-issues"
+        onUpdateIssue={() => undefined}
+      />,
+      container,
+    );
+
+    await waitForAssertion(() => {
+      expect(container.textContent).toContain("Alpha issue");
+      expect(container.textContent).toContain("Beta issue");
+    });
+
+    act(() => {
+      root.unmount();
+    });
+  });
+
   it("applies an initial workspace filter from the issues URL state", async () => {
     const alphaIssue = createIssue({
       id: "issue-alpha",
@@ -1821,11 +2062,17 @@ describe("IssuesList", () => {
     });
   });
 
-  it("shows routine-backed issues by default and hides them when the routine filter is toggled off", async () => {
+  it.each([true, false])("keeps visibility controls and fetching preferences synchronized (streamlined=%s)", async (streamlined) => {
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableStreamlinedUi: streamlined });
+    function PreferenceProbe() {
+      const included = useShowAgentCreatedTasks("company-1", "paperclip:test-issues");
+      return <span data-testid="creation-preference">{String(included)}</span>;
+    }
     const manualIssue = createIssue({
       id: "issue-manual",
       identifier: "PAP-10",
       title: "Manual issue",
+      createdByUserId: "person",
       originKind: "manual",
     });
     const routineIssue = createIssue({
@@ -1836,20 +2083,20 @@ describe("IssuesList", () => {
     });
 
     const { root } = renderWithQueryClient(
-      <IssuesList
+      <><PreferenceProbe /><IssuesList
         issues={[manualIssue, routineIssue]}
         agents={[]}
         projects={[]}
         viewStateKey="paperclip:test-issues"
-        enableRoutineVisibilityFilter
+        enableAgentCreatedVisibilityFilter
         onUpdateIssue={() => undefined}
-      />,
+      /></>,
       container,
     );
 
     await waitForAssertion(() => {
       expect(container.textContent).toContain("Manual issue");
-      expect(container.textContent).toContain("Routine issue");
+      expect(container.textContent).not.toContain("Routine issue");
     });
 
     await act(async () => {
@@ -1862,26 +2109,38 @@ describe("IssuesList", () => {
 
     await waitForAssertion(() => {
       const toggle = Array.from(document.body.querySelectorAll("label")).find(
-        (label) => label.textContent?.includes("Hide routine runs"),
+        (label) => label.textContent?.includes("show agent-created tasks"),
       );
       expect(toggle).not.toBeUndefined();
     });
 
     await act(async () => {
       const toggle = Array.from(document.body.querySelectorAll("label")).find(
-        (label) => label.textContent?.includes("Hide routine runs"),
+        (label) => label.textContent?.includes("show agent-created tasks"),
       );
       toggle?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       await Promise.resolve();
     });
 
     await waitForAssertion(() => {
+      expect(container.textContent).toContain("Routine issue");
+      expect(container.querySelector("[data-testid='creation-preference']")?.textContent).toBe("true");
+    });
+    const preferenceKey = taskCollectionPreferencesStorageKey({ companyId: "company-1", collectionKey: "paperclip:test-issues" });
+    const envelope = JSON.parse(localStorage.getItem(preferenceKey)!);
+    await act(async () => {
+      localStorage.setItem(preferenceKey, JSON.stringify({ ...envelope, viewState: { ...envelope.viewState, showAgentCreatedTasks: false } }));
+      window.dispatchEvent(new StorageEvent("storage", { key: preferenceKey }));
+    });
+    await waitForAssertion(() => {
       expect(container.textContent).not.toContain("Routine issue");
+      expect(container.querySelector("[data-testid='creation-preference']")?.textContent).toBe("false");
+      const label = Array.from(document.body.querySelectorAll("label")).find((element) => element.textContent?.includes("show agent-created tasks"));
+      const checkbox = label?.querySelector("[role='checkbox'], input[type='checkbox']");
+      expect(checkbox).not.toBeNull();
+      expect(checkbox instanceof HTMLInputElement ? checkbox.checked : checkbox?.getAttribute("aria-checked") === "true").toBe(false);
     });
-
-    act(() => {
-      root.unmount();
-    });
+    act(() => root.unmount());
   });
 
   it("blurs the search input on Enter without clearing the query", async () => {
@@ -2013,11 +2272,11 @@ describe("IssuesList", () => {
     });
   });
 
-  it("draws day and week separators between recency-sorted rows", async () => {
-    const now = Date.now();
-    const hourAgo = new Date(now - 60 * 60 * 1000);
-    const threeDaysAgo = new Date(now - 3 * 24 * 60 * 60 * 1000);
-    const tenDaysAgo = new Date(now - 10 * 24 * 60 * 60 * 1000);
+  it("draws local-calendar separators between date-sorted rows", async () => {
+    const now = new Date();
+    const hourAgo = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 12);
+    const threeDaysAgo = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 3, 12);
+    const tenDaysAgo = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 10, 12);
 
     const { root } = renderWithQueryClient(
       <IssuesList
@@ -2029,6 +2288,7 @@ describe("IssuesList", () => {
         agents={[]}
         projects={[]}
         viewStateKey="paperclip:test-issues"
+        rowPresentation="task"
         onUpdateIssue={() => undefined}
       />,
       container,
@@ -2037,7 +2297,13 @@ describe("IssuesList", () => {
     await waitForAssertion(() => {
       const separators = Array.from(container.querySelectorAll("[data-issues-date-separator]"));
       const labels = separators.map((el) => el.getAttribute("aria-label"));
-      expect(labels).toEqual(["Older than a day", "Older than a week"]);
+      expect(labels).toEqual(["Today", "Earlier"]);
+      expect(separators.every((separator) => (
+        separator.querySelectorAll("[data-date-group-rule]").length === 2
+      ))).toBe(true);
+      expect(separators.every((separator) => (
+        separator.querySelector("[data-date-group-label]")?.classList.contains("text-muted-foreground/70")
+      ))).toBe(true);
     });
 
     act(() => {
@@ -2045,18 +2311,65 @@ describe("IssuesList", () => {
     });
   });
 
-  it("draws both separators when adjacent rows skip the middle age bucket", async () => {
-    const now = Date.now();
+  it("can hide date group separators from the persisted Columns option", async () => {
+    const collectionKey = "paperclip:test-issues";
+    localStorage.setItem(
+      taskCollectionPreferencesStorageKey({
+        companyId: "company-1",
+        collectionKey,
+      }),
+      JSON.stringify({
+        version: 1,
+        companyId: "company-1",
+        collectionKey,
+        viewState: { showDateGroupSeparators: false },
+        columns: ["status", "id", "updated"],
+      }),
+    );
+    const now = new Date();
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 12);
+    const threeDaysAgo = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 3, 12);
 
     const { root } = renderWithQueryClient(
       <IssuesList
         issues={[
-          createIssue({ id: "issue-recent", identifier: "PAP-1", title: "Just updated", updatedAt: new Date(now - 60 * 60 * 1000) }),
-          createIssue({ id: "issue-old", identifier: "PAP-2", title: "Over a week old", updatedAt: new Date(now - 10 * 24 * 60 * 60 * 1000) }),
+          createIssue({ id: "issue-recent", title: "Just updated", updatedAt: today }),
+          createIssue({ id: "issue-old", title: "Earlier task", updatedAt: threeDaysAgo }),
+        ]}
+        agents={[]}
+        projects={[]}
+        viewStateKey={collectionKey}
+        rowPresentation="task"
+        onUpdateIssue={() => undefined}
+      />,
+      container,
+    );
+
+    await waitForAssertion(() => {
+      expect(container.textContent).toContain("Earlier task");
+      expect(container.querySelector("[data-issues-date-separator]")).toBeNull();
+    });
+
+    act(() => {
+      root.unmount();
+    });
+  });
+
+  it("does not synthesize an empty Yesterday group", async () => {
+    const now = new Date();
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 12);
+    const tenDaysAgo = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 10, 12);
+
+    const { root } = renderWithQueryClient(
+      <IssuesList
+        issues={[
+          createIssue({ id: "issue-recent", identifier: "PAP-1", title: "Just updated", updatedAt: today }),
+          createIssue({ id: "issue-old", identifier: "PAP-2", title: "Over a week old", updatedAt: tenDaysAgo }),
         ]}
         agents={[]}
         projects={[]}
         viewStateKey="paperclip:test-issues"
+        rowPresentation="task"
         onUpdateIssue={() => undefined}
       />,
       container,
@@ -2065,7 +2378,7 @@ describe("IssuesList", () => {
     await waitForAssertion(() => {
       const labels = Array.from(container.querySelectorAll("[data-issues-date-separator]"))
         .map((el) => el.getAttribute("aria-label"));
-      expect(labels).toEqual(["Older than a day", "Older than a week"]);
+      expect(labels).toEqual(["Today", "Earlier"]);
     });
 
     act(() => {
@@ -2074,18 +2387,22 @@ describe("IssuesList", () => {
   });
 
   it("places separators around expanded nested rows in visible order", async () => {
-    const now = Date.now();
+    const now = new Date();
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 12);
+    const threeDaysAgo = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 3, 12);
+    const tenDaysAgo = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 10, 12);
 
     const { root } = renderWithQueryClient(
       <IssuesList
         issues={[
-          createIssue({ id: "issue-parent", identifier: "PAP-1", title: "Recent parent", updatedAt: new Date(now - 60 * 60 * 1000) }),
-          createIssue({ id: "issue-child", identifier: "PAP-2", parentId: "issue-parent", title: "Older child", updatedAt: new Date(now - 3 * 24 * 60 * 60 * 1000) }),
-          createIssue({ id: "issue-old", identifier: "PAP-3", title: "Old root", updatedAt: new Date(now - 10 * 24 * 60 * 60 * 1000) }),
+          createIssue({ id: "issue-parent", identifier: "PAP-1", title: "Recent parent", updatedAt: today }),
+          createIssue({ id: "issue-child", identifier: "PAP-2", parentId: "issue-parent", title: "Older child", updatedAt: threeDaysAgo }),
+          createIssue({ id: "issue-old", identifier: "PAP-3", title: "Old root", updatedAt: tenDaysAgo }),
         ]}
         agents={[]}
         projects={[]}
         viewStateKey="paperclip:test-issues"
+        rowPresentation="task"
         onUpdateIssue={() => undefined}
       />,
       container,
@@ -2096,10 +2413,10 @@ describe("IssuesList", () => {
         container.querySelectorAll("[data-testid='issue-row'], [data-issues-date-separator]"),
       ).map((element) => element.getAttribute("aria-label") ?? element.firstElementChild?.textContent);
       expect(visibleOrder).toEqual([
+        "Today",
         "Recent parent",
-        "Older than a day",
+        "Earlier",
         "Older child",
-        "Older than a week",
         "Old root",
       ]);
     });
@@ -2109,18 +2426,21 @@ describe("IssuesList", () => {
     });
   });
 
-  it("omits date separators when all rows share a recency bucket", async () => {
-    const now = Date.now();
+  it("emits one Today heading when all rows share today's calendar group", async () => {
+    const now = new Date();
+    const todayMorning = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 9);
+    const todayNoon = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 12);
 
     const { root } = renderWithQueryClient(
       <IssuesList
         issues={[
-          createIssue({ id: "issue-a", identifier: "PAP-1", title: "One", updatedAt: new Date(now - 60 * 60 * 1000) }),
-          createIssue({ id: "issue-b", identifier: "PAP-2", title: "Two", updatedAt: new Date(now - 2 * 60 * 60 * 1000) }),
+          createIssue({ id: "issue-a", identifier: "PAP-1", title: "One", updatedAt: todayNoon }),
+          createIssue({ id: "issue-b", identifier: "PAP-2", title: "Two", updatedAt: todayMorning }),
         ]}
         agents={[]}
         projects={[]}
         viewStateKey="paperclip:test-issues"
+        rowPresentation="task"
         onUpdateIssue={() => undefined}
       />,
       container,
@@ -2129,7 +2449,8 @@ describe("IssuesList", () => {
     await waitForAssertion(() => {
       expect(container.querySelector("[data-testid='issue-row']")).not.toBeNull();
     });
-    expect(container.querySelectorAll("[data-issues-date-separator]").length).toBe(0);
+    expect(Array.from(container.querySelectorAll("[data-issues-date-separator]"))
+      .map((element) => element.getAttribute("aria-label"))).toEqual(["Today"]);
 
     act(() => {
       root.unmount();
@@ -2137,24 +2458,15 @@ describe("IssuesList", () => {
   });
 });
 
-describe("issueAgeBucket", () => {
+describe("legacy issue age separators", () => {
   const now = new Date("2026-04-10T12:00:00.000Z").getTime();
 
-  it("buckets by day and week boundaries", () => {
+  it("retains the rolling day and week boundaries used by the legacy list", () => {
     expect(issueAgeBucket(new Date(now - 60 * 60 * 1000), now)).toBe(0);
     expect(issueAgeBucket(new Date(now - 3 * 24 * 60 * 60 * 1000), now)).toBe(1);
     expect(issueAgeBucket(new Date(now - 10 * 24 * 60 * 60 * 1000), now)).toBe(2);
-  });
-
-  it("labels the day and week separators", () => {
     expect(issueAgeSeparatorLabel(1)).toBe("Older than a day");
     expect(issueAgeSeparatorLabel(2)).toBe("Older than a week");
-  });
-
-  it("returns every boundary crossed between adjacent rows", () => {
-    expect(issueAgeBucketsCrossed(0, 1)).toEqual([1]);
-    expect(issueAgeBucketsCrossed(1, 2)).toEqual([2]);
     expect(issueAgeBucketsCrossed(0, 2)).toEqual([1, 2]);
-    expect(issueAgeBucketsCrossed(2, 1)).toEqual([]);
   });
 });

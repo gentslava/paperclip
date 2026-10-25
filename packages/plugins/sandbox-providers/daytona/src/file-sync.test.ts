@@ -17,7 +17,7 @@ vi.mock("@daytonaio/sdk", () => ({
   DaytonaTimeoutError: class MockDaytonaTimeoutError extends Error {},
 }));
 
-import { performSyncIn } from "./file-sync.js";
+import { performSyncIn, performSyncOut } from "./file-sync.js";
 import { __setDaytonaPluginContextForTest } from "./plugin.js";
 import type { PluginContext, PluginSyncOperation } from "@paperclipai/plugin-sdk";
 
@@ -157,6 +157,35 @@ describe("daytona file-sync inbound scratch cleanup", () => {
     );
     expect(standaloneRemoves).toHaveLength(0);
   });
+
+  it("writes an inbound file mapping to a sandbox path outside the workspace root", async () => {
+    const hostDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-daytona-outside-root-"));
+    cleanupDirs.push(hostDir);
+    const sourcePath = path.join(hostDir, "source.txt");
+    await fs.writeFile(sourcePath, "payload");
+
+    // A target outside the workspace remote dir. The inbound direction writes
+    // host data into the sandbox, and the sandbox already has read/write
+    // authority over its own filesystem, so the provider no longer confines
+    // the target to the remote dir.
+    const remoteDir = "/workspace";
+    const targetPath = "/etc/paperclip-outside-root.txt";
+    const uploadedDestinations: string[] = [];
+    const commands: RecordedCommand[] = [];
+    const sandbox = createMockSandbox({ uploadedDestinations, commands });
+
+    const operations: PluginSyncOperation[] = [{
+      operationId: "sync-op-outside-root",
+      files: [{ sourcePath, targetPath, kind: "file" }],
+    }];
+
+    const result = await performSyncIn({ sandbox: sandbox as never, operations, remoteDir, timeoutSeconds: 30 });
+
+    expect(result.operations[0].filesTransferred).toBe(1);
+    const promoteCommand = commands.map((entry) => entry.command).find((command) => command.includes("mv -f"));
+    expect(promoteCommand).toBeDefined();
+    expect(promoteCommand).toContain(targetPath);
+  });
 });
 
 // ---------------------------------------------------------------
@@ -189,24 +218,6 @@ async function writeCompressibleFile(filePath: string, sizeBytes: number): Promi
 
 async function writeIncompressibleFile(filePath: string, sizeBytes: number): Promise<void> {
   await fs.writeFile(filePath, crypto.randomBytes(sizeBytes));
-}
-
-/**
- * Extract the raw scratch pathname from a promote-script command's own text.
- * The promote script embeds the path inside `shellQuote`, and the WHOLE
- * script is itself `shellQuote`d again for the outer `sh -c` wrapper — so the
- * literal `'...'` delimiters around the path get escaped and are not a
- * reliable anchor. The path text itself has no shell metacharacters (it is
- * `remoteDir` + a UUID-based scratch name), so it survives both quoting
- * passes unchanged and is matched directly instead. The script always emits
- * the raw scratch's `exec 9> ...` line before the `.zst` scratch's
- * `zstd -d -c -- ...` line, so the FIRST match is always the raw name.
- */
-function extractRawScratchPath(command: string, remoteDir: string): string {
-  const escapedRoot = remoteDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const match = command.match(new RegExp(`${escapedRoot}/\\.paperclip-upload-[0-9a-f-]+`));
-  if (!match) throw new Error("test setup: could not find the raw scratch path in the promote script");
-  return match[0];
 }
 
 /**
@@ -251,29 +262,19 @@ function createRecordingSandbox(input: {
  * `setFilePermissions` apply real bytes/modes onto a real directory standing
  * in for the sandbox root. This proves the decompression/promotion script
  * for real, instead of only recording which commands the code would send.
- *
- * `beforeCommand` runs (and may `await` a filesystem mutation) immediately
- * before each real command executes. The race-regression test uses it to
- * plant a pre-created scratch name at exactly the moment a sandbox peer could
- * have observed the pathname (the R2 residual the design discloses), and the
- * parent-swap test uses it to swap a target's parent dir between the
- * confinement guard and the promotion round trip.
  */
 function createRealExecSandbox(input?: {
-  beforeCommand?: (command: string, index: number) => void | Promise<void>;
   uploadOverride?: (uploads: Array<{ source: string; destination: string }>) => Promise<boolean>;
+  commandEnv?: NodeJS.ProcessEnv;
 }) {
   const commands: RecordedCommand[] = [];
-  let index = 0;
   return {
     commands,
     sandbox: {
       process: {
         executeCommand: async (command: string) => {
-          await input?.beforeCommand?.(command, index);
-          index += 1;
           commands.push({ command });
-          const result = spawnSync("/bin/sh", ["-c", command], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+          const result = spawnSync("/bin/sh", ["-c", command], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, env: input?.commandEnv });
           return { exitCode: result.status ?? 1, result: (result.stdout ?? "") + (result.stderr ?? "") };
         },
       },
@@ -289,6 +290,153 @@ function createRealExecSandbox(input?: {
     },
   };
 }
+
+// Daytona uses GNU tar. macOS contributors can install gnu-tar; the usual
+// Linux CI path runs this directly without extra dependencies.
+const gnuTar = ["gtar", "tar"].map((candidate) => {
+  const resolved = spawnSync("/bin/sh", ["-c", 'command -v "$1"', "sh", candidate], { encoding: "utf8" }).stdout.trim();
+  return resolved && spawnSync(resolved, ["--version"], { encoding: "utf8" }).stdout?.includes("GNU tar") ? resolved : null;
+}).find(Boolean);
+
+it.skipIf(!gnuTar)("extracts interleaved read-only skill directories with GNU tar and preserves their modes", async () => {
+  const root = await fs.mkdtemp("/tmp/paperclip-daytona-readonly-");
+  const source = path.join(root, "source");
+  const remoteDir = path.join(root, "remote");
+  const target = path.join(remoteDir, "skill");
+  const bin = path.join(root, "bin");
+  await fs.mkdir(path.join(source, "references", "agents"), { recursive: true });
+  await fs.mkdir(remoteDir);
+  await fs.mkdir(bin);
+  await fs.symlink(gnuTar!, path.join(bin, "tar"));
+  await fs.writeFile(path.join(source, "references", "overview.md"), "overview", { mode: 0o444 });
+  await fs.writeFile(path.join(source, "references", "agents", "qa.md"), "QA instructions", { mode: 0o444 });
+  for (const dir of ["references/agents", "references"]) await fs.chmod(path.join(source, dir), 0o555);
+  try {
+    const { sandbox } = createRealExecSandbox({
+      commandEnv: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
+      uploadOverride: async (uploads) => {
+        for (const upload of uploads) {
+          // BSD tar can list a child directory before its parent's files, then
+          // visit that child later. GNU tar must not finalize its 0555 mode early.
+          const archive = spawnSync(gnuTar!, ["-c", "--owner=12345", "--group=12345", "--no-xattrs", "--no-recursion", "-f", upload.destination, "-C", source,
+            "references", "references/agents", "references/overview.md", "references/agents/qa.md"], { encoding: "utf8", env: { ...process.env, COPYFILE_DISABLE: "1" } });
+          expect(archive.status, archive.stderr).toBe(0);
+        }
+        return true;
+      },
+    });
+    await performSyncIn({ sandbox: sandbox as never, remoteDir, timeoutSeconds: 30,
+      operations: [{ operationId: "readonly-skill", files: [{ sourcePath: source, targetPath: target, kind: "directory", mode: 0o555 }] }] });
+    // A resumed sandbox already contains the previous read-only skill bundle.
+    await fs.writeFile(path.join(target, "unrelated.txt"), "keep me");
+    await performSyncIn({ sandbox: sandbox as never, remoteDir, timeoutSeconds: 30,
+      operations: [{ operationId: "readonly-skill-resume", files: [{ sourcePath: source, targetPath: target, kind: "directory", mode: 0o555 }] }] });
+    expect(await fs.readFile(path.join(target, "unrelated.txt"), "utf8")).toBe("keep me");
+    expect(await fs.readFile(path.join(target, "references", "agents", "qa.md"), "utf8")).toBe("QA instructions");
+    expect((await fs.stat(path.join(target, "references", "agents"))).mode & 0o777).toBe(0o555);
+    expect((await fs.stat(path.join(target, "references", "agents", "qa.md"))).mode & 0o777).toBe(0o444);
+    // Never treat a corrupted read-only bundle as a cache hit, even if its
+    // file size, permissions and timestamp still match the source archive.
+    const qa = path.join(target, "references", "agents", "qa.md");
+    const before = await fs.stat(qa);
+    await fs.chmod(qa, 0o644);
+    await fs.writeFile(qa, "XX instructions");
+    await fs.chmod(qa, 0o444);
+    await fs.utimes(qa, before.atime, before.mtime);
+    await expect(performSyncIn({ sandbox: sandbox as never, remoteDir, timeoutSeconds: 30,
+      operations: [{ operationId: "corrupt-skill-resume", files: [{ sourcePath: source, targetPath: target, kind: "directory", mode: 0o555 }] }] })).rejects.toThrow("syncIn extract");
+    expect(await fs.readFile(qa, "utf8")).toBe("XX instructions");
+    expect((await fs.readdir(remoteDir)).filter((name) => name.startsWith(".paperclip-upload"))).toEqual([]);
+
+  } finally {
+    for (const base of [source, target]) {
+      for (const dir of ["references/agents", "references"]) await fs.chmod(path.join(base, dir), 0o700).catch(() => undefined);
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}, 30_000);
+
+it.skipIf(!gnuTar)("uploads gzip directory archives and preserves content, executable modes, and symlinks", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-daytona-gzip-dir-"));
+  const source = path.join(root, "source");
+  const remoteDir = path.join(root, "remote");
+  const target = path.join(remoteDir, "target");
+  const bin = path.join(root, "bin");
+  await fs.mkdir(path.join(source, "bin"), { recursive: true });
+  await fs.mkdir(remoteDir);
+  await fs.mkdir(bin);
+  await fs.symlink(gnuTar!, path.join(bin, "tar"));
+  await fs.writeFile(path.join(source, "bin", "tool.sh"), "#!/bin/sh\necho ok\n", { mode: 0o755 });
+  await fs.symlink("bin/tool.sh", path.join(source, "tool-link"));
+
+  try {
+    let uploadedArchiveBytes: Buffer | undefined;
+    const { sandbox } = createRealExecSandbox({
+      commandEnv: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
+      uploadOverride: async (uploads) => {
+        uploadedArchiveBytes = await fs.readFile(uploads[0]!.source);
+        for (const upload of uploads) await fs.copyFile(upload.source, upload.destination);
+        return true;
+      },
+    });
+
+    await performSyncIn({
+      sandbox: sandbox as never,
+      remoteDir,
+      timeoutSeconds: 30,
+      operations: [{
+        operationId: "gzip-directory",
+        files: [{ sourcePath: source, targetPath: target, kind: "directory" }],
+      }],
+    });
+
+    expect(uploadedArchiveBytes).toBeDefined();
+    expect(uploadedArchiveBytes!.subarray(0, 2)).toEqual(Buffer.from([0x1f, 0x8b]));
+    expect(await fs.readFile(path.join(target, "bin", "tool.sh"), "utf8")).toBe("#!/bin/sh\necho ok\n");
+    expect((await fs.stat(path.join(target, "bin", "tool.sh"))).mode & 0o777).toBe(0o755);
+    expect(await fs.readlink(path.join(target, "tool-link"))).toBe("bin/tool.sh");
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}, 30_000);
+
+it.skipIf(!gnuTar)("uploads and extracts a gzip empty directory archive", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-daytona-gzip-empty-"));
+  const source = path.join(root, "source");
+  const remoteDir = path.join(root, "remote");
+  const target = path.join(remoteDir, "target");
+  const bin = path.join(root, "bin");
+  await fs.mkdir(source);
+  await fs.mkdir(remoteDir);
+  await fs.mkdir(bin);
+  await fs.symlink(gnuTar!, path.join(bin, "tar"));
+
+  try {
+    let uploadedArchiveBytes: Buffer | undefined;
+    const { sandbox } = createRealExecSandbox({
+      commandEnv: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
+      uploadOverride: async (uploads) => {
+        uploadedArchiveBytes = await fs.readFile(uploads[0]!.source);
+        for (const upload of uploads) await fs.copyFile(upload.source, upload.destination);
+        return true;
+      },
+    });
+    await performSyncIn({
+      sandbox: sandbox as never,
+      remoteDir,
+      timeoutSeconds: 30,
+      operations: [{
+        operationId: "gzip-empty-directory",
+        files: [{ sourcePath: source, targetPath: target, kind: "directory" }],
+      }],
+    });
+    expect(uploadedArchiveBytes).toBeDefined();
+    expect(uploadedArchiveBytes!.subarray(0, 2)).toEqual(Buffer.from([0x1f, 0x8b]));
+    expect(await fs.readdir(target)).toEqual([]);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}, 30_000);
 
 describe("daytona file-sync inbound zstd transport compression", () => {
   const cleanupDirs: string[] = [];
@@ -325,9 +473,9 @@ describe("daytona file-sync inbound zstd transport compression", () => {
 
       expect(result.operations[0].filesTransferred).toBe(1);
       expect(result.operations[0].bytesTransferred).toBe(ZSTD_MIN_SOURCE_BYTES_FOR_TEST + 1024);
-      // The promote script actually ran a real `zstd -d -c` — proves decompression
+      // The promote script actually ran a real `zstd -d -o` — proves decompression
       // happened, not just that the code called `uploadFiles`.
-      expect(commands.some((entry) => entry.command.includes("zstd -d -c"))).toBe(true);
+      expect(commands.some((entry) => entry.command.includes("zstd -d -o"))).toBe(true);
       expect(await sha256OfFile(targetPath)).toBe(await sha256OfFile(sourcePath));
 
       // Cleanup on success: no reserved scratch (raw or `.zst`) remains.
@@ -506,109 +654,7 @@ describe("daytona file-sync inbound zstd transport compression", () => {
       expect(remaining.filter((name) => name.includes(".paperclip-upload"))).toHaveLength(0); // scratch swept
     });
 
-    it("refuses a pre-created regular file at the raw scratch name (race regression, C1)", async () => {
-      const remoteDir = await mkTempDir("paperclip-daytona-zstd-remote-");
-      const hostDir = await mkTempDir("paperclip-daytona-zstd-host-");
-      const sourcePath = path.join(hostDir, "workspace-upload.tar");
-      await writeCompressibleFile(sourcePath, ZSTD_MIN_SOURCE_BYTES_FOR_TEST + 1024);
-      const targetPath = path.posix.join(remoteDir, "target.bin");
-
-      let injected = false;
-      const { sandbox } = createRealExecSandbox({
-        beforeCommand: async (command) => {
-          if (injected || !command.includes("zstd -d -c")) return;
-          const rawScratchPath = extractRawScratchPath(command, remoteDir);
-          injected = true;
-          // A peer that reads this command's own text (the R2 residual) claims
-          // the reserved name first, as a plain pre-existing file.
-          await fs.writeFile(rawScratchPath, "attacker-controlled pre-existing content");
-        },
-      });
-      const operations: PluginSyncOperation[] = [{
-        operationId: "sync-op-1",
-        files: [{ sourcePath, targetPath, kind: "file" }],
-      }];
-
-      await expect(
-        performSyncIn({ sandbox: sandbox as never, operations, remoteDir, timeoutSeconds: 30 }),
-      ).rejects.toThrow();
-
-      expect(injected).toBe(true);
-      await expect(fs.stat(targetPath)).rejects.toThrow(); // never promoted
-    });
-
-    it("refuses a pre-created symlink at the raw scratch name and never writes through it (race regression, C1)", async () => {
-      const remoteDir = await mkTempDir("paperclip-daytona-zstd-remote-");
-      const hostDir = await mkTempDir("paperclip-daytona-zstd-host-");
-      const sourcePath = path.join(hostDir, "workspace-upload.tar");
-      await writeCompressibleFile(sourcePath, ZSTD_MIN_SOURCE_BYTES_FOR_TEST + 1024);
-      const targetPath = path.posix.join(remoteDir, "target.bin");
-      const sentinelPath = path.join(hostDir, "outside-the-workspace-root.txt");
-      const sentinelContent = "PRE-EXISTING CONTENT, MUST SURVIVE UNCHANGED\n";
-      await fs.writeFile(sentinelPath, sentinelContent);
-
-      let injected = false;
-      const { sandbox } = createRealExecSandbox({
-        beforeCommand: async (command) => {
-          if (injected || !command.includes("zstd -d -c")) return;
-          const rawScratchPath = extractRawScratchPath(command, remoteDir);
-          injected = true;
-          // A peer that reads this command's own text (the R2 residual) claims
-          // the reserved name first, as a symlink pointing OUTSIDE the workspace
-          // root — the attack shape a create-with-mode-not-check-then-create
-          // primitive must refuse.
-          await fs.symlink(sentinelPath, rawScratchPath);
-        },
-      });
-      const operations: PluginSyncOperation[] = [{
-        operationId: "sync-op-1",
-        files: [{ sourcePath, targetPath, kind: "file" }],
-      }];
-
-      await expect(
-        performSyncIn({ sandbox: sandbox as never, operations, remoteDir, timeoutSeconds: 30 }),
-      ).rejects.toThrow();
-
-      expect(injected).toBe(true);
-      await expect(fs.stat(targetPath)).rejects.toThrow(); // never promoted
-      // The symlink's target was never opened/written through: content unchanged,
-      // and no write landed outside the workspace root.
-      expect(await fs.readFile(sentinelPath, "utf8")).toBe(sentinelContent);
-    });
-
-    it("still fails at the fd re-verification when a target's parent dir is swapped after the confinement guard", async () => {
-      const remoteDir = await mkTempDir("paperclip-daytona-zstd-remote-");
-      const hostDir = await mkTempDir("paperclip-daytona-zstd-host-");
-      const outsideDir = await mkTempDir("paperclip-daytona-zstd-outside-");
-      const realParentDir = path.posix.join(remoteDir, "nested");
-      const targetPath = path.posix.join(realParentDir, "target.bin");
-      const sourcePath = path.join(hostDir, "small.bin");
-      await fs.writeFile(sourcePath, "small file, well below the compression threshold\n");
-
-      let swapped = false;
-      const { sandbox } = createRealExecSandbox({
-        beforeCommand: async (_command, index) => {
-          // index 0 = mkdir+probe, index 1 = checkSymlinkEscape, index 2 = promote.
-          if (index !== 2 || swapped) return;
-          swapped = true;
-          await fs.rm(realParentDir, { recursive: true, force: true });
-          await fs.symlink(outsideDir, realParentDir);
-        },
-      });
-      const operations: PluginSyncOperation[] = [{
-        operationId: "sync-op-1",
-        files: [{ sourcePath, targetPath, kind: "file" }],
-      }];
-
-      await expect(
-        performSyncIn({ sandbox: sandbox as never, operations, remoteDir, timeoutSeconds: 30 }),
-      ).rejects.toThrow(/ESCAPE|syncIn rename/);
-
-      expect(swapped).toBe(true);
-      expect(await fs.readdir(outsideDir)).toHaveLength(0); // nothing landed outside the root
-    });
-
-    it("applies mapping.mode via the retained descriptor, defaulting to 0600 when unset", async () => {
+    it("applies mapping.mode via chmod before promotion, when set", async () => {
       const remoteDir = await mkTempDir("paperclip-daytona-zstd-remote-");
       const hostDir = await mkTempDir("paperclip-daytona-zstd-host-");
       const sourceNoMode = path.join(hostDir, "no-mode.tar");
@@ -618,7 +664,21 @@ describe("daytona file-sync inbound zstd transport compression", () => {
       const targetNoMode = path.posix.join(remoteDir, "no-mode.bin");
       const targetWithMode = path.posix.join(remoteDir, "with-mode.bin");
 
-      const { sandbox } = createRealExecSandbox();
+      // `zstd -d -o` copies the mode of its INPUT (the uploaded `.zst`
+      // scratch) onto its output. Widen every `.zst` scratch to 0644 here,
+      // standing in for a Daytona upload that does not preserve a host-side
+      // 0600 origin. A pass on the no-mode assertion below then proves the
+      // promote script's OWN `chmod` forces 0600 — not that the scratch
+      // happened to arrive owner-only already.
+      const { sandbox } = createRealExecSandbox({
+        uploadOverride: async (uploads) => {
+          for (const upload of uploads) {
+            await fs.copyFile(upload.source, upload.destination);
+            if (upload.destination.endsWith(".zst")) await fs.chmod(upload.destination, 0o644);
+          }
+          return true;
+        },
+      });
       const operations: PluginSyncOperation[] = [{
         operationId: "sync-op-1",
         files: [
@@ -629,6 +689,11 @@ describe("daytona file-sync inbound zstd transport compression", () => {
 
       await performSyncIn({ sandbox: sandbox as never, operations, remoteDir, timeoutSeconds: 30 });
 
+      // A mapping with no `mode` lands owner-only (0600): the promote script
+      // always runs `chmod` on the decompressed file right after
+      // `zstd -d -o`, and uses 0600 when the mapping sets no `mode` — even
+      // though its `.zst` scratch arrived at 0644 above. A mapping with an
+      // explicit `mode` gets that mode instead.
       expect((await fs.stat(targetNoMode)).mode & 0o777).toBe(0o600);
       expect((await fs.stat(targetWithMode)).mode & 0o777).toBe(0o640);
     });
@@ -1012,8 +1077,110 @@ describe("daytona file-sync inbound zstd transport compression", () => {
 
       await performSyncIn({ sandbox: sandbox as never, operations, remoteDir: "/workspace", timeoutSeconds: 123 });
 
-      expect(seenTimeouts.length).toBeGreaterThanOrEqual(4); // mkdir+probe, checkSymlinkEscape, transfer, promote
+      expect(seenTimeouts.length).toBeGreaterThanOrEqual(3); // mkdir and probe, transfer, promote
       expect(seenTimeouts.every((timeout) => timeout === 123)).toBe(true);
     });
+  });
+});
+
+
+describe.skipIf(!gnuTar)("automatic unsafe workspace export recovery", () => {
+  const cleanupDirs: string[] = [];
+  afterEach(async () => {
+    await Promise.all(cleanupDirs.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
+  });
+  it.each(["/usr/bin/pnpm", "../../outside.txt", "ambiguous", "ambiguous-target"])("preserves files and safe links when a link is unsafe: %s", async (target) => {
+    const root = await fs.mkdtemp("/tmp/paperclip-export-recovery-");
+    cleanupDirs.push(root);
+    const remoteDir = path.join(root, "remote");
+    const output = path.join(root, "output");
+    const bin = path.join(root, "bin");
+    await fs.mkdir(path.join(remoteDir, "nested"), { recursive: true });
+    await fs.mkdir(path.join(remoteDir, "cache"));
+    await fs.mkdir(path.join(remoteDir, "empty"));
+    await fs.mkdir(bin);
+    await fs.symlink(gnuTar!, path.join(bin, "tar"));
+    await fs.writeFile(path.join(root, "outside.txt"), "private bytes");
+    await fs.writeFile(path.join(remoteDir, "nested", "--safe [file].txt"), "saved work", { mode: 0o600 });
+    await fs.writeFile(path.join(remoteDir, "cache", "ignored.txt"), "excluded");
+    const linkName = target === "ambiguous" ? "tool -> decoy" : "tool";
+    const linkTarget = target === "ambiguous" ? "--safe [file].txt" : target === "ambiguous-target" ? "saved -> work.txt" : target;
+    if (target === "ambiguous-target") await fs.writeFile(path.join(remoteDir, "nested", linkTarget), "more saved work");
+    await fs.symlink(linkTarget, path.join(remoteDir, "nested", linkName));
+    await fs.symlink("nested/--safe [file].txt", path.join(remoteDir, "safe-link"));
+    await fs.link(path.join(remoteDir, "nested", "--safe [file].txt"), path.join(remoteDir, "hard-link"));
+    const downloads = vi.fn(async (requests: Array<{ source: string; destination: string }>) => {
+      for (const request of requests) await fs.copyFile(request.source, request.destination);
+      return requests.map(({ source }) => ({ source }));
+    });
+    const recovery = vi.fn();
+    const { sandbox } = createRealExecSandbox({ commandEnv: { ...process.env, PATH: `${bin}:${process.env.PATH}` } });
+    Object.assign(sandbox.fs, { downloadFiles: downloads, deleteFile: (file: string) => fs.rm(file, { force: true }) });
+    await expect(performSyncOut({ sandbox: sandbox as never, remoteDir, timeoutSeconds: 30, onArchiveRecovery: recovery,
+      operations: [{ operationId: "export", files: [{ sourcePath: remoteDir, targetPath: output, kind: "directory", exclude: ["cache"] }] }],
+    })).resolves.toMatchObject({ operations: [{ operationId: "export", filesTransferred: target === "ambiguous-target" ? 4 : 3 }] });
+    expect(downloads).toHaveBeenCalledTimes(2);
+    expect(recovery).toHaveBeenCalledOnce();
+    expect(await fs.readFile(path.join(output, "nested", "--safe [file].txt"), "utf8")).toBe("saved work");
+    expect((await fs.stat(path.join(output, "nested", "--safe [file].txt"))).mode & 0o777).toBe(0o600);
+    expect(await fs.readFile(path.join(output, "hard-link"), "utf8")).toBe("saved work");
+    await expect(fs.lstat(path.join(output, "nested", linkName))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await fs.readlink(path.join(output, "safe-link"))).toBe("nested/--safe [file].txt");
+    expect(await fs.readdir(path.join(output, "empty"))).toEqual([]);
+    await expect(fs.stat(path.join(output, "cache", "ignored.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await fs.readFile(path.join(root, "outside.txt"), "utf8")).toBe("private bytes");
+    expect((await fs.lstat(path.join(remoteDir, "nested", linkName))).isSymbolicLink()).toBe(true);
+    expect((await fs.readdir(remoteDir)).filter((name) => name.startsWith(".paperclip-upload"))).toEqual([]);
+  });
+
+  it("finishes an export containing only unsafe links with an empty directory", async () => {
+    const root = await fs.mkdtemp("/tmp/paperclip-export-empty-");
+    cleanupDirs.push(root);
+    const remoteDir = path.join(root, "remote");
+    const output = path.join(root, "output");
+    const bin = path.join(root, "bin");
+    await fs.mkdir(remoteDir);
+    await fs.mkdir(bin);
+    await fs.symlink(gnuTar!, path.join(bin, "tar"));
+    await fs.symlink("/usr/bin/pnpm", path.join(remoteDir, "pnpm"));
+    const { sandbox } = createRealExecSandbox({ commandEnv: { ...process.env, PATH: `${bin}:${process.env.PATH}` } });
+    Object.assign(sandbox.fs, {
+      downloadFiles: async (requests: Array<{ source: string; destination: string }>) => {
+        for (const request of requests) await fs.copyFile(request.source, request.destination);
+        return requests.map(({ source }) => ({ source }));
+      },
+      deleteFile: (file: string) => fs.rm(file, { force: true }),
+    });
+    await performSyncOut({ sandbox: sandbox as never, remoteDir, timeoutSeconds: 30,
+      operations: [{ operationId: "empty", files: [{ sourcePath: remoteDir, targetPath: output, kind: "directory" }] }],
+    });
+    expect(await fs.readdir(output)).toEqual([]);
+  });
+});
+
+
+describe("precompressed file transport", () => {
+  it.each(["gzip", "zstd"])("uploads %s bytes without trying to recompress them", async codec => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-compressed-transfer-"));
+    try {
+      const raw = crypto.randomBytes(ZSTD_MIN_SOURCE_BYTES_FOR_TEST + 1024);
+      const bytes = codec === "gzip" ? zlib.gzipSync(raw) : zlib.zstdCompressSync(raw);
+      expect(bytes.length).toBeGreaterThan(ZSTD_MIN_SOURCE_BYTES_FOR_TEST);
+      const source = path.join(root, "artifact-without-extension");
+      await fs.writeFile(source, bytes);
+      const uploadedSources: string[] = [];
+      const uploadedDestinations: string[] = [];
+      const commands: RecordedCommand[] = [];
+      const sandbox = createRecordingSandbox({ probeReportsZstd: true, uploadedSources, uploadedDestinations, commands });
+      const compressor = vi.spyOn(zlib, "createZstdCompress");
+      await performSyncIn({ sandbox: sandbox as never, remoteDir: "/workspace", timeoutSeconds: 30,
+        operations: [{ operationId: "archive", files: [{ kind: "file", sourcePath: source, targetPath: "/workspace/archive", mode: 0o600 }] }] });
+      expect(compressor).not.toHaveBeenCalled();
+      expect(uploadedSources).toEqual([source]);
+      expect(await sha256OfFile(source)).toBe(crypto.createHash("sha256").update(bytes).digest("hex"));
+    } finally {
+      vi.restoreAllMocks();
+      await fs.rm(root, { recursive: true, force: true });
+    }
   });
 });

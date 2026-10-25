@@ -11,18 +11,25 @@ vi.mock("./issues.js", () => ({
 
 type SelectRow = Record<string, unknown>;
 
-function createSelectChain(rows: SelectRow[]) {
+function createSelectChain(rows: SelectRow[] | ((table: unknown) => SelectRow[])) {
   return {
-    from() {
-      return {
+    from(table: unknown) {
+      const selectedRows = typeof rows === "function" ? rows(table) : rows;
+      const query = {
+        innerJoin() {
+          return query;
+        },
         where() {
-          return {
-            then(callback: (rows: SelectRow[]) => unknown) {
-              return Promise.resolve(callback(rows));
-            },
-          };
+          return query;
+        },
+        for() {
+          return query;
+        },
+        then(callback: (rows: SelectRow[]) => unknown) {
+          return Promise.resolve(callback(selectedRows));
         },
       };
+      return query;
     },
   };
 }
@@ -41,7 +48,8 @@ function createFakeDb(args: {
   const db: any = {
     select: vi.fn(() => {
       selectCallCount += 1;
-      return createSelectChain(selectCallCount === 1 ? [interactionRow] : (args.parentRows ?? []));
+      const rows = selectCallCount === 1 ? [interactionRow] : (args.parentRows ?? []);
+      return createSelectChain(table => getTableName(table as never) === "issues" ? [{ status: "in_progress" }] : rows);
     }),
     update: vi.fn((table: unknown) => ({
       set(values: Record<string, unknown>) {
@@ -164,8 +172,12 @@ describe("issueThreadInteractionService", () => {
       updatedAt: new Date("2026-04-20T10:00:00.000Z"),
     };
 
+    let selectCallCount = 0;
     const db: any = {
-      select: vi.fn(() => createSelectChain([existingRow])),
+      select: vi.fn(() => {
+        selectCallCount += 1;
+        return createSelectChain(selectCallCount <= 2 ? [existingRow] : []);
+      }),
       insert: vi.fn(),
       update: vi.fn(),
     };
