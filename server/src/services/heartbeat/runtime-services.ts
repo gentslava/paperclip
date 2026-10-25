@@ -1,5 +1,5 @@
-import { eq } from "drizzle-orm";
-import { heartbeatRuns, type Db } from "@paperclipai/db";
+import type { Db } from "@paperclipai/db";
+import { mergeRunRuntimeServicesIntoSnapshot } from "../run-context-snapshot.js";
 import type { AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import { parseObject } from "../../adapters/utils.js";
 import { assertLowTrustRuntimeServicesAllowed } from "../low-trust-runtime-containment.js";
@@ -120,16 +120,15 @@ export async function startHeartbeatRuntimeServices(db: Db, input: RuntimeServic
   });
   if (runtimeServices.length > 0) {
     context.paperclipRuntimeServices = runtimeServices;
-    context.paperclipRuntimePrimaryUrl =
+    const primaryUrl =
       runtimeServices.find((service) => readNonEmptyString(service.url))
         ?.url ?? null;
-    await db
-      .update(heartbeatRuns)
-      .set({
-        contextSnapshot: context,
-        updatedAt: new Date(),
-      })
-      .where(eq(heartbeatRuns.id, run.id));
+    context.paperclipRuntimePrimaryUrl = primaryUrl;
+    await mergeRunRuntimeServicesIntoSnapshot(db, {
+      runId: run.id,
+      runtimeServices: runtimeServices,
+      primaryUrl,
+    });
   }
   if (
     issueId &&
@@ -182,17 +181,16 @@ export async function recordHeartbeatAdapterRuntimeServices(db: Db, input: Runti
       ...adapterManagedRuntimeServices,
     ];
     context.paperclipRuntimeServices = combinedRuntimeServices;
-    context.paperclipRuntimePrimaryUrl =
+    const primaryUrl =
       combinedRuntimeServices.find((service) =>
         readNonEmptyString(service.url),
       )?.url ?? null;
-    await db
-      .update(heartbeatRuns)
-      .set({
-        contextSnapshot: context,
-        updatedAt: new Date(),
-      })
-      .where(eq(heartbeatRuns.id, run.id));
+    context.paperclipRuntimePrimaryUrl = primaryUrl;
+    await mergeRunRuntimeServicesIntoSnapshot(db, {
+      runId: run.id,
+      runtimeServices: combinedRuntimeServices,
+      primaryUrl,
+    });
     if (issueId) {
       try {
         await postWorkspaceReadyComment({
