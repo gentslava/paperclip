@@ -86,6 +86,8 @@ function fixture(entry: Entry, options: { intentFailure?: boolean; qualification
     },
   });
   const page = {
+    on() { return this; },
+    off() { return this; },
     getByLabel(label: string) { return locator(() => controls().filter(control => control.name === label && control.role === "textbox")); },
     getByRole(role: string, { name: label }: { name: string | RegExp }) {
       return locator(() => controls().filter(control => control.role === role && match(control.name, label)));
@@ -93,6 +95,7 @@ function fixture(entry: Entry, options: { intentFailure?: boolean; qualification
     locator(selector: string) { expect(selector).toBe("summary"); return locator(() => controls().filter(control => control.role === "summary")); },
   };
   const context = { page, company: { id: "company" }, identity: { kind: "cloud" }, startingState: "recipe", api: {
+    origin: "https://tenant.example.test",
     async get(route: string) {
       if (route.endsWith("/ai-connections")) return { connections: saved ? [connection] : [] };
       if (route.endsWith("/agents")) return hired ? [{ id: "agent", name, adapterType: "paperclip_runner", adapterConfig: { provider: "codex", model: gateway.model } }] : [];

@@ -300,6 +300,38 @@ describe("PaperclipControlPlanePort conformance", () => {
     }
   });
 
+  it("permits only read-only admission while an existing startup drains", async () => {
+    const identity = { ...CONTROL_PLANE_CONFORMANCE_OPEN.identity, runId: randomUUID(), sessionId: randomUUID() };
+    const runnerId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: identity.runId, companyId: identity.companyId, agentId: identity.agentId,
+      status: "running", runtimeMode: "native", nativeIssueId: identity.issueId,
+      nativeSessionId: identity.sessionId, runnerInstanceId: runnerId,
+      completionContractId: contractId, completionContractSha256: contractSha,
+    });
+    let awaitingStartup = true;
+    const port = new PaperclipControlPlanePort(db, {
+      ...identity, completionContractId: contractId, completionContractSha256: contractSha,
+      sourceInstanceId: runnerId, controlPlaneSourceInstanceId: `draining-${identity.runId}`,
+    }, {
+      assertControllerActive: () => { throw new Error("controller_detached"); },
+      assertRunAdmissionActive: () => { if (!awaitingStartup) throw new Error("controller_detached"); },
+    });
+    const open = { identity, backendKind: "mock" as const, sourceInstanceId: runnerId };
+    await expect(port.openRun({ ...open, sourceInstanceId: randomUUID() })).rejects.toThrow("native_open_run_binding_mismatch");
+    await db.update(heartbeatRuns).set({ runnerInstanceId: randomUUID() }).where(eq(heartbeatRuns.id, identity.runId));
+    await expect(port.openRun(open)).rejects.toThrow("native_open_run_not_authorized");
+    await db.update(heartbeatRuns).set({ runnerInstanceId: runnerId }).where(eq(heartbeatRuns.id, identity.runId));
+    await expect(port.openRun(open)).resolves.toBeUndefined();
+    await expect(port.checkpointSession({ backendKind: "mock", sessionId: identity.sessionId, identity })).rejects.toThrow("controller_detached");
+    await expect(port.completeRun({ result: CONTROL_PLANE_CONFORMANCE_RESULT, terminal: CONTROL_PLANE_CONFORMANCE_TERMINAL })).rejects.toThrow("controller_detached");
+    awaitingStartup = false;
+    await expect(port.openRun(open)).rejects.toThrow("controller_detached");
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, identity.runId));
+    expect(run.runnerProfileJson?.sessionCheckpoint).toBeUndefined();
+    expect(await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, identity.runId))).toEqual([]);
+  });
+
   it.each([
     ["checkpoint", "detach"], ["result", "detach"], ["event", "detach"],
     ["checkpoint", "abort"], ["result", "abort"], ["event", "abort"],

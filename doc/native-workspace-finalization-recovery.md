@@ -505,3 +505,11 @@ acknowledgement receipt, and process identity. It does not load saved execution
 input, runner profiles, excerpts, or unrelated result fields. Lease cleanup,
 remote termination receipts, local process checks, task ownership, and admission
 checks keep their existing behavior. Stored runs retain all of their data.
+
+One periodic stranded-message pass coalesces successful native release checks
+for the same company, task, source run, and current source row version. The release
+path already drains that
+task's queue through current admission checks. Each saved request still advances
+its recovery cursor. Rejected attempts, changed source runs, and updated source evidence remain eligible,
+and the next pass checks current state again. Legacy per-request handling stays
+unchanged. Pending work is awaited before a source is marked checked.

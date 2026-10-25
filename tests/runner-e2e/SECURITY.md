@@ -14,6 +14,13 @@ their expected four-field result, exact base64 download bytes, checksums, size,
 and attachment/run IDs. Extra fields and arbitrary agent output are rejected.
 It contains no credentials, browser state, request headers, or provider text.
 
+The optional `onboardingConnect` diagnostic is also a closed, versioned receipt.
+It retains only a known checkpoint, response states, HTTP statuses, known adapter
+names, and allowlisted outcome/check/server codes (at most 32 checks per response).
+Unknown codes become `unrecognized`; raw bodies, messages, URLs, headers, and
+browser errors are excluded. Reports validate the receipt before rendering its
+explicit fields, and historical results may omit it.
+
 ## Attended connection authentication
 
 See [PROVIDER-CONNECTIONS.md](PROVIDER-CONNECTIONS.md) for the explicit-only

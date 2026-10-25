@@ -237,6 +237,11 @@ The explicit [deployment-targeted Product journeys](PRODUCT-JOURNEYS.md) reuse
 browser actions across managed self-hosted and Cloud targets. They include a
 model-free task-properties story, fresh Cloud onboarding, credential-free
 previews, private evidence, and prerequisite reuse; `--all` is unchanged.
+Cloud onboarding may retain a versioned `onboardingConnect` receipt for the
+Connect action: its last checkpoint, validation/hire response state and HTTP
+status, known adapters, and allowlisted outcome/check/server codes. The case
+report renders these fields explicitly; older results without the receipt remain
+valid. This diagnostic does not change the journey grade or qualify a live run.
 
 ## Live provider connection journeys
 

@@ -28,6 +28,7 @@ export interface JourneyEvidence {
   attemptId?: string;
   operations?: JourneyOperations;
   artifact?: OnboardingArtifactEvidence;
+  onboardingConnect?: import("./onboarding-connect.js").OnboardingConnectEvidence;
 }
 export interface OnboardingArtifactEvidence {
   schema: "paperclip.product-journey.artifact/v1";

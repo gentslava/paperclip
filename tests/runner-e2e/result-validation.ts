@@ -4,6 +4,7 @@ import { githubJourneyCheckpoints, gradeGitHubReviewJourney } from "./github-rev
 import { STARTUP_REUSE_LAYERS, STARTUP_REUSE_REASONS } from "../../packages/adapter-utils/src/startup-reuse.js";
 import type { RunnerE2ECampaignAccounting, RunnerE2EResult } from "./types.js";
 import { DEPENDABLE_CELLS } from "./dependable-qualification.js";
+import { validateOnboardingConnectEvidence } from "./product-journeys/onboarding-connect.js";
 import { validateOnboardingArtifact } from "./product-journeys/artifact-evidence.js";
 
 type Rule = (value: unknown, at: string) => void;
@@ -344,6 +345,7 @@ const fields = {
   productJourney: optional(shape({
     targetId: optional(string),
     campaignId: optional(string), attemptId: optional(string),
+    onboardingConnect: optional((value, at) => { try { validateOnboardingConnectEvidence(value); } catch { invalid(at); } }),
     artifact: optional((value, at) => { try { validateOnboardingArtifact(value); } catch { invalid(at); } }),
     operations: optional(closedShape({ campaignId: string, attemptId: string, modelCostUsd: nullable(number), setupCostUsd: nullable(number), requestCount: integer,
       feedback: closedShape({ collection: oneOf("complete", "partial", "unavailable"), complaints: integer, suggestions: integer }), traceIds: array(string) })),
