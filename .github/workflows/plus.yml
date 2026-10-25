@@ -8,6 +8,17 @@ on:
   schedule:
     - cron: "30 10 * * *" # after the upstream nightly image (~08:45 UTC)
   workflow_dispatch:
+    inputs:
+      upstream_sha:
+        description: Optional full upstream master commit SHA for a qualified manual build
+        required: false
+        default: ''
+        type: string
+      expected_tree:
+        description: Qualified Git source tree SHA, required together with upstream_sha
+        required: false
+        default: ''
+        type: string
 
 concurrency:
   group: plus
@@ -30,11 +41,25 @@ jobs:
           path: config
 
       - name: Clone upstream master
+        id: upstream
+        env:
+          PINNED_UPSTREAM_SHA: ${{ inputs.upstream_sha || '' }}
+          EXPECTED_TREE: ${{ inputs.expected_tree || '' }}
         run: |
           set -euo pipefail
           git clone --filter=blob:none --no-tags --branch master \
             https://github.com/paperclipai/paperclip.git src
           cd src
+          if [ -n "$PINNED_UPSTREAM_SHA" ] || [ -n "$EXPECTED_TREE" ]; then
+            if [[ ! "$PINNED_UPSTREAM_SHA" =~ ^[0-9a-f]{40}$ || ! "$EXPECTED_TREE" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::upstream_sha and expected_tree must be supplied together as full lowercase SHAs"
+              exit 1
+            fi
+            git cat-file -e "$PINNED_UPSTREAM_SHA^{commit}"
+            git merge-base --is-ancestor "$PINNED_UPSTREAM_SHA" refs/remotes/origin/master
+            git checkout --detach "$PINNED_UPSTREAM_SHA"
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
@@ -102,13 +127,35 @@ jobs:
           pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile
           git status --porcelain
 
+      - name: Verify qualified source tree
+        working-directory: src
+        env:
+          EXPECTED_TREE: ${{ inputs.expected_tree || '' }}
+        run: |
+          set -euo pipefail
+          [ -n "$EXPECTED_TREE" ] || exit 0
+          if [[ ! "$EXPECTED_TREE" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::expected_tree must be a full lowercase tree SHA"
+            exit 1
+          fi
+          git add --all
+          actual_tree="$(git write-tree)"
+          if [ "$actual_tree" != "$EXPECTED_TREE" ]; then
+            echo "::error::source tree mismatch: expected $EXPECTED_TREE, got $actual_tree"
+            git status --short
+            exit 1
+          fi
+          echo "Qualified source tree verified: $actual_tree"
+
       - name: Build metadata
         id: meta
         working-directory: src
+        env:
+          SELECTED_UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
         run: |
           set -euo pipefail
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "upstream=$(git rev-parse --short origin/master)" >> "$GITHUB_OUTPUT"
+          echo "upstream=$(git rev-parse --short "$SELECTED_UPSTREAM_SHA")" >> "$GITHUB_OUTPUT"
           echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
           echo "epoch=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
 
