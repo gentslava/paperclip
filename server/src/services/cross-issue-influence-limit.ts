@@ -109,6 +109,11 @@ export async function observeCrossIssueInfluence(
       throw crossIssueInfluenceRunContextError();
     }
 
+    // An unscoped run (timer heartbeat with no checked-out issue) has no source
+    // issue, so every issue write it makes is cross-issue by definition and
+    // spends the cap. The locked run row above is the attribution anchor;
+    // rejecting these writes as run-less left live heartbeat runs unable to
+    // comment or update any task at all.
     const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
     if (!sourceIssueId) {
       // Durable self-issue fallback. `context_snapshot.issueId` is written
@@ -124,7 +129,7 @@ export async function observeCrossIssueInfluence(
         const targetLock = await tx
           .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
           .from(issues)
-          .where(eq(issues.id, input.targetIssueId))
+          .where(and(eq(issues.id, input.targetIssueId), eq(issues.companyId, input.companyId)))
           .then((rows) => rows[0] ?? null);
         if (
           targetLock &&
@@ -133,11 +138,11 @@ export async function observeCrossIssueInfluence(
           return null;
         }
       }
-      throw crossIssueInfluenceRunContextError();
     }
     if (
-      sourceIssueId === input.targetIssueId ||
-      (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
+      sourceIssueId !== null &&
+      (sourceIssueId === input.targetIssueId ||
+        (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase()))
     ) {
       return null;
     }

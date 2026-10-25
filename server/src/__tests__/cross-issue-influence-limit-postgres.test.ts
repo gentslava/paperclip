@@ -43,7 +43,7 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
     await tempDb?.cleanup();
   });
 
-  it("allows exactly one of concurrent attempts 20 and 21", async () => {
+  it.each([false, true])("serializes the influence cap with an unscoped run: %s", async (unscoped) => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const runId = randomUUID();
@@ -72,7 +72,7 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
       agentId,
       status: "running",
       responsibleUserId: "board-user",
-      contextSnapshot: { issueId: sourceIssueId },
+      contextSnapshot: unscoped ? { source: "timer" } : { issueId: sourceIssueId },
     });
     await db.insert(activityLog).values(
       Array.from({ length: 18 }, () => ({
@@ -307,14 +307,14 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
       { id: otherIssueId, companyId, title: "Not owned" },
     ]);
 
-    // A run without the lock and without a snapshot anchor is still rejected.
+    // An unscoped run without the lock spends the normal influence budget.
     await expect(observeCrossIssueInfluence(db, {
       companyId,
       runId: otherRunId,
       agentId,
       targetIssueId: checkedOutIssueId,
       kind: "comment",
-    })).rejects.toMatchObject({ status: 403 });
+    })).resolves.toMatchObject({ allowed: true, count: 1 });
 
     // The owning run is allowed via the checkout lock even though the anchor is gone.
     await expect(observeCrossIssueInfluence(db, {
@@ -333,21 +333,21 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
       kind: "update",
     })).resolves.toBeNull();
 
-    // Holding a lock on one issue does not widen writes to an unowned issue.
+    // Holding a lock on one issue does not exempt writes to an unowned issue.
     await expect(observeCrossIssueInfluence(db, {
       companyId,
       runId,
       agentId,
       targetIssueId: otherIssueId,
       kind: "comment",
-    })).rejects.toMatchObject({ status: 403 });
+    })).resolves.toMatchObject({ allowed: true, count: 1 });
 
-    // The allow-path records no influence row, same as `sourceIssueId === target`.
+    // Only the unowned issue write consumes influence; owned writes are exempt.
     const recorded = await db
       .select({ id: activityLog.id })
       .from(activityLog)
       .where(and(eq(activityLog.companyId, companyId), eq(activityLog.runId, runId)));
-    expect(recorded).toHaveLength(0);
+    expect(recorded).toHaveLength(1);
   });
 
   it("meters writes to an issue a run has checked out when the run already has a source issue", async () => {
