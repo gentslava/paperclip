@@ -18,9 +18,19 @@ function SignInPage({ mode }: { mode: AuthSignUpMode }) {
 }
 
 const meta: Meta<typeof SignInPage> = {
-  title: "Auth/Sign-up modes",
+  id: "auth-sign-up-modes",
+  title: "Getting started and access/Login, invitations, and access/Sign-up modes",
   component: SignInPage,
-  parameters: { layout: "fullscreen" },
+  parameters: {
+    layout: "fullscreen",
+    paperclip: {
+      capabilities: ["access/login"],
+      status: "unreviewed",
+      implementation: "production",
+      boundary: "fixtures",
+      notes: "AuthPage registration modes use cached health/session fixtures; live authentication and invitation acceptance remain separate.",
+    },
+  },
 };
 
 export default meta;
