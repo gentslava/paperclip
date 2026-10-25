@@ -71,8 +71,8 @@ jobs:
           included=()
           while read -r entry _; do
             [ -z "$entry" ] && continue
-            # "N" merges pull/N/head. "N@branch" merges our rebased copy of PR N
-            # from this repo's branch instead, until N is merged or closed upstream.
+            # "N" merges pull/N/head. "N@source" merges a compatible fork
+            # commit SHA or branch until N is merged or closed upstream.
             pr="${entry%%@*}"
             branch=""
             [ "$entry" != "$pr" ] && branch="${entry#*@}"
@@ -82,8 +82,12 @@ jobs:
               continue
             fi
             if [ -n "$branch" ]; then
-              git fetch -q --no-tags "https://github.com/${GITHUB_REPOSITORY}.git" "refs/heads/$branch:pr-$pr"
-              echo "::notice::#$pr merged from ${GITHUB_REPOSITORY}@$branch (our rebase onto master)"
+              source_ref="refs/heads/$branch"
+              if [[ "$branch" =~ ^[0-9a-f]{40}$ ]]; then
+                source_ref="$branch"
+              fi
+              git fetch -q --no-tags "https://github.com/${GITHUB_REPOSITORY}.git" "$source_ref:pr-$pr"
+              echo "::notice::#$pr merged from ${GITHUB_REPOSITORY}@$branch"
             else
               git fetch -q --no-tags origin "pull/$pr/head:pr-$pr"
             fi
