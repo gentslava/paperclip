@@ -1,8 +1,12 @@
 import { TextAttachmentContext } from "@/context/TextAttachmentContext";
+import { useArtifactsV1Enabled } from "@/hooks/useArtifactsV1Enabled";
+import { ArtifactRow, ArtifactRowGroup, inlineRowStyle, subjectFromAttachmentRef } from "@/components/artifacts/v1";
 import { isTextAttachment } from "@/lib/issue-attachments";
 import { ArtifactPreview } from "@/components/artifacts/ArtifactCard";
 import { isVideoLikeOutput } from "@/lib/issue-output";
 import { AgentAvatar, type AvatarAgent } from "../AgentAvatar";
+import { Identity } from "../Identity";
+import { paperclipHumanAvatarUrl } from "@/lib/issue-chat-human-author";
 import { useCallback, useContext, useState, type ReactNode } from "react";
 import { useEmailComment } from "@/components/EmailMessageCard";
 import type { IssueAttachment } from "@paperclipai/shared";
@@ -95,9 +99,9 @@ export function TaskChatAgentIdentity({
 }
 
 /**
- * Author-typed message row — the primary legibility signal. Human messages sit
- * right in a solid accent bubble; agent messages sit directly on the page
- * surface with an avatar author header (the agent's assigned icon + name);
+ * Viewer-relative message row — the primary legibility signal. Own messages sit
+ * right in a solid accent bubble; agents and other humans sit on the left
+ * directly on the page surface with their own avatar and name;
  * system notices are centered and recede.
  */
 function galleryItemForMedia(
@@ -142,6 +146,7 @@ function TaskChatBubbleContent({
   tryAgainNoLiveExecutionPathPending,
 }: TaskChatBubbleProps) {
   const streamlined = useStreamlinedTaskChatPresentation();
+  const { enabled: artifactsV1 } = useArtifactsV1Enabled();
   const openText = useContext(TextAttachmentContext);
   // Task attachments share the page gallery; standalone images retain the bubble viewer.
   const openIssueGallery = useContext(IssueGalleryContext);
@@ -171,6 +176,7 @@ function TaskChatBubbleContent({
   }
 
   const isHuman = item.author === "human";
+  const isOwnMessage = isHuman && item.isCurrentUser === true;
   const sentFromIMessage = isHuman && item.sourceChannel === "imessage-photon";
   // Non-image file references ("[name](/api/attachments/…/content)") render as
   // attachment chips under the bubble; link-only lines leave the body text.
@@ -216,13 +222,19 @@ function TaskChatBubbleContent({
       : Math.max(0, mediaRefs.findIndex((ref) => ref.url === lightboxSrc));
   return (
     <div
+      data-conversation-message={isHuman ? "human" : "agent"}
       className={cn(
         "flex w-full flex-col gap-1",
         animateEntry && "tc-enter-bubble",
-        isHuman ? "items-end" : "items-start",
+        isOwnMessage ? "items-end" : "items-start",
       )}
     >
       {beforeTurn ? <div className="w-full pb-1">{beforeTurn}</div> : null}
+      {isHuman && !item.isCurrentUser && item.authorName ? (
+        <span className="px-1 text-sm font-semibold text-foreground" data-testid="task-chat-human-identity" data-author-user-id={item.authorUserId}>
+          <Identity name={item.authorName} avatarUrl={paperclipHumanAvatarUrl(item.authorAvatarUrl)} size="default" className="gap-2" />
+        </span>
+      ) : null}
       {!isHuman && item.authorName && !hideAgentIdentity ? (
         <TaskChatAgentIdentity
           agentName={item.authorName}
@@ -232,6 +244,7 @@ function TaskChatBubbleContent({
       ) : null}
       {bodyText.length > 0 ? (
         <div
+          data-conversation-text={isHuman ? (isOwnMessage ? "human" : "progress") : item.channel === "progress" ? "progress" : "final"}
           // Stable hook so the TaskChatLab bubble-treatment explorations
           // (PAP-501) can scope background/border overrides to the agent
           // bubble body without touching the live thread.
@@ -240,19 +253,19 @@ function TaskChatBubbleContent({
           }
           className={cn(
             "break-words py-2 text-sm",
-            isHuman
+            isOwnMessage
               ? "max-w-(--pct-85) rounded-2xl rounded-br-sm bg-(--liveness-blue) px-3.5 text-white"
               : "w-full bg-transparent px-1 text-foreground",
           )}
         >
           <MarkdownBody
-            // The human bubble sits on the solid --liveness-blue accent, so the
+            // The own-message bubble sits on the solid --liveness-blue accent, so the
             // prose body text must follow the bubble's `text-white` rather than
             // the default light-mode prose color (which reads as black on blue).
             // `paperclip-markdown-on-accent` flips prose tokens to currentColor
             // (== inherited white) in both themes; dark mode was already correct
             // only because `prose-invert` happened to lighten the text.
-            className={isHuman ? "paperclip-markdown-on-accent" : undefined}
+            className={isOwnMessage ? "paperclip-markdown-on-accent" : undefined}
             softBreaks
             linkIssueReferences
             onImageClick={openImage}
@@ -261,7 +274,7 @@ function TaskChatBubbleContent({
           </MarkdownBody>
         </div>
       ) : null}
-      {imageRefs.length > 0 ? (
+      {!artifactsV1 && imageRefs.length > 0 ? (
         <div
           className="flex max-w-(--pct-85) flex-col gap-2"
           data-testid="task-chat-bubble-media"
@@ -304,7 +317,7 @@ function TaskChatBubbleContent({
           </span>
         </div>
       ) : null}
-      {attachmentRefs.length > 0 ? (
+      {!artifactsV1 && attachmentRefs.length > 0 ? (
         <div className="flex max-w-(--pct-85) flex-col gap-2">
           <span className="text-xs text-muted-foreground">
             Files · {attachmentRefs.length}
@@ -419,6 +432,24 @@ function TaskChatBubbleContent({
           {sentFromIMessage && item.timestamp ? " · " : null}
           {item.timestamp}
         </span>
+      ) : null}
+      {artifactsV1 && imageRefs.length + attachmentRefs.length > 0 ? (
+        // Artifacts V1 (doc/plans/2026-10-22-artifacts-mvp-v1.md): the files a message produced hang under its
+        // footer, 12px below, as rows inline at equal widths, wrapping past three. Pictures and video open the
+        // gallery, text opens a text tab when the panel offers one, anything else opens in a new tab.
+        <div className="w-full pt-2" data-testid="task-chat-bubble-artifacts-v1">
+          <ArtifactRowGroup>
+            {[...imageRefs, ...attachmentRefs].map((ref) => {
+              const subject = subjectFromAttachmentRef(ref);
+              const picture = isImageAttachment(ref) || isVideoLikeOutput(ref.contentType, ref.name);
+              const textTab = Boolean(openText && ref.id && isTextAttachment({ contentType: ref.contentType ?? "", originalFilename: ref.name }));
+              if (picture) return <ArtifactRow key={ref.url} subject={subject} onClick={() => openImage(ref.url)} style={inlineRowStyle} />;
+              // A text file keeps its link (modifier clicks, copying the address) while a plain click opens the text tab.
+              if (textTab) return <ArtifactRow key={ref.url} subject={subject} href={ref.openPath ?? ref.url} external onClick={() => openText?.(ref.id!, ref.name)} style={inlineRowStyle} />;
+              return <ArtifactRow key={ref.url} subject={subject} href={ref.openPath ?? ref.url} external style={inlineRowStyle} />;
+            })}
+          </ArtifactRowGroup>
+        </div>
       ) : null}
       {lightboxSrc !== null && lightboxIndex >= 0 ? (
         <ImageGalleryModal

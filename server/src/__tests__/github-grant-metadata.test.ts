@@ -24,12 +24,12 @@ describe("GitHub grant metadata", () => {
       }
       if (url.pathname === "/user/installations/101/repositories") {
         return json({ total_count: 2, repositories: secondPage
-          ? [{ id: 2, full_name: "paperclipai/b", private: true, description: "must-not-persist", clone_url: "must-not-persist" }]
-          : [{ id: 1, full_name: "paperclipai/a", private: false }],
+          ? [{ id: 2, full_name: "paperclipai/b", owner: { type: "Organization" }, private: true, description: "must-not-persist", clone_url: "must-not-persist" }]
+          : [{ id: 1, full_name: "paperclipai/a", owner: { type: "Organization" }, private: false }],
         }, !secondPage);
       }
       if (url.pathname === "/user/installations/102/repositories") {
-        return json({ total_count: 1, repositories: [{ id: 3, full_name: "octocat/c" }] });
+        return json({ total_count: 1, repositories: [{ id: 3, full_name: "octocat/c", owner: { type: "User" } }] });
       }
       throw new Error(`Unexpected GitHub path: ${url.pathname}`);
     });
@@ -44,9 +44,9 @@ describe("GitHub grant metadata", () => {
       installationIds: ["101", "102"],
       installationOwnerLogins: ["paperclipai", "octocat"],
       repositories: [
-        { id: "3", fullName: "octocat/c", installationId: "102" },
-        { id: "1", fullName: "paperclipai/a", installationId: "101", private: false },
-        { id: "2", fullName: "paperclipai/b", installationId: "101", private: true },
+        { id: "3", fullName: "octocat/c", installationId: "102", ownerType: "personal" },
+        { id: "1", fullName: "paperclipai/a", installationId: "101", ownerType: "organization", private: false },
+        { id: "2", fullName: "paperclipai/b", installationId: "101", ownerType: "organization", private: true },
       ],
       installationUrl: "https://github.com/apps/paperclip-development/installations/new",
       managementUrl: "https://github.com/settings/installations/101",
@@ -91,5 +91,28 @@ describe("GitHub grant metadata", () => {
     await expect(loadGitHubGrantMetadata("ghu_secret", request)).rejects.toMatchObject({
       details: expect.objectContaining({ code: "github_access_check_failed" }),
     });
+  });
+
+  it.each([
+    [401, "oauth_reauthorization_required"],
+    [503, "github_access_check_failed"],
+  ])("preserves the retry decision for HTTP %s without reflecting provider text", async (status, code) => {
+    const request = vi.fn<typeof fetch>().mockResolvedValue(new Response("private provider detail", { status }));
+    await expect(loadGitHubGrantMetadata("ghu_secret", request)).rejects.toMatchObject({
+      status: 422,
+      message: "GitHub could not verify this account's installation access",
+      details: { code },
+    });
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects an empty next page before reporting an incomplete access snapshot", async () => {
+    const request = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(json({ id: 42, login: "octocat" }))
+      .mockResolvedValueOnce(json({ installations: [] }, true));
+    await expect(loadGitHubGrantMetadata("ghu_secret", request)).rejects.toMatchObject({
+      details: { code: "github_bad_response" },
+    });
+    expect(request).toHaveBeenCalledTimes(2);
   });
 });
