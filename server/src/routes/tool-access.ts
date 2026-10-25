@@ -1,9 +1,15 @@
+import { isCrossSiteOAuthCallbackNavigation, oauthCallbackInterstitialHtml } from "../lib/oauth-browser-return.js";
+import { aiConnectionRouterPluginKey } from "@paperclipai/shared";
+import { aiConnectionRouterService } from "../services/ai-connection-router.js";
+import { composioAppSetupSchema, composioAppsRefreshSchema, composioAppsSyncSchema, composioAppAccountSchema } from "@paperclipai/shared";
+import { aggregatorAppsSyncSchema, aggregatorAppsRefreshSchema, arcadeDiscoverySetupSchema } from "@paperclipai/shared/aggregator-apps";
 import { Router, type Request, type Response } from "express";
 import type { Db } from "@paperclipai/db";
 import { agents, companies, connectionGrants, issueThreadInteractions, toolConnectionInstalls } from "@paperclipai/db";
 import { and, eq, or } from "drizzle-orm";
 import {
   APP_STORE_DEFINITIONS,
+  isConnectorFeatureEnabled,
   isMemoryConnectorId,
   GITHUB_CONNECTOR_PROFILES,
   GOOGLE_WORKSPACE_CONNECTOR_PROFILES,
@@ -197,7 +203,7 @@ function normalizeCloudConnectorEnrollmentReturnTo(returnTo?: string | null): st
     const parsed = new URL(returnTo, "http://paperclip.local");
     if (
       parsed.origin !== "http://paperclip.local"
-      || parsed.pathname !== "/apps/connect"
+      || !["/apps/connect", "/apps/chat/connect"].includes(parsed.pathname)
       || parsed.username
       || parsed.password
     ) return null;
@@ -322,7 +328,7 @@ export function toolAccessRoutes(
     }
   }
 
-  function requestLoopbackBaseUrl(req: Request) {
+  function requestLoopbackBaseUrl(req: Request, forInitiation = false) {
     const host = req.get("host")?.trim();
     if (!host) return null;
     try {
@@ -341,8 +347,7 @@ export function toolAccessRoutes(
       // interoperable spelling and retain the browser's exact origin as OAuth
       // state for popup postMessage below.
       if (
-        req.method !== "GET"
-        && req.method !== "HEAD"
+        (forInitiation || (req.method !== "GET" && req.method !== "HEAD"))
         && (options.deploymentMode ?? "local_trusted") === "local_trusted"
         && parsed.protocol === "http:"
         && parsed.hostname !== "localhost"
@@ -370,7 +375,7 @@ export function toolAccessRoutes(
         : null;
       if (
         parsed.host.toLowerCase() === normalizedRoutedHost
-        && (parsed.protocol === "https:" || (parsed.protocol === "http:" && isLoopbackHost(parsed.hostname)))
+        && parsed.protocol === "https:"
       ) {
         return parsed.origin;
       }
@@ -409,11 +414,11 @@ export function toolAccessRoutes(
     return null;
   }
 
-  function oauthRedirectUri(req: Request) {
+  function oauthRedirectUri(req: Request, forInitiation = false) {
     const baseUrl = configuredPublicBaseUrl()
       ?? trustedBrowserBaseUrl(req)
       ?? enrolledConnectorBaseUrl(req)
-      ?? requestLoopbackBaseUrl(req);
+      ?? requestLoopbackBaseUrl(req, forInitiation);
     if (!baseUrl) {
       throw unprocessable(
         "This Paperclip needs a browser-reachable HTTPS address (or loopback HTTP) before browser sign-in can start.",
@@ -815,8 +820,23 @@ function connectorEnrollmentPrincipal(req: Request): string {
         ? await options.paperclipCloudConnector.getCapabilities()
         : [];
     const vercelConnect = vercelConnectIntegrationStatus();
-    const { enableMemoryConnectors } = await instanceSettingsService(db).getExperimental();
+    const settings = await instanceSettingsService(db).getExperimental();
+    let oauthCallbackUrl: string | undefined;
+    try {
+      // Setup must display the callback used by its initiating POST. Provider
+      // callbacks themselves retain their exact request-derived redirect URI.
+      oauthCallbackUrl = oauthRedirectUri(req, true);
+    } catch (error) {
+      const details = error instanceof HttpError
+        && error.details
+        && typeof error.details === "object"
+        && !Array.isArray(error.details)
+        ? error.details as Record<string, unknown>
+        : null;
+      if (details?.code !== "oauth_redirect_origin_unsupported") throw error;
+    }
     res.json({
+      ...(oauthCallbackUrl ? { oauthCallbackUrl } : {}),
       capabilities: await describeConnectionCreateCapabilities(req, companyId),
       credentialSources: {
         vercelConnect: {
@@ -831,9 +851,10 @@ function connectorEnrollmentPrincipal(req: Request): string {
             : "Vercel Connect setup is disabled on this Paperclip instance.",
         },
       },
-      apps: APP_STORE_DEFINITIONS.filter((app) => (enableMemoryConnectors || !isMemoryConnectorId(app.slug))).map((app) =>
+      apps: [...APP_STORE_DEFINITIONS.filter((app) => (settings.enableMemoryConnectors || !isMemoryConnectorId(app.slug))
+        && isConnectorFeatureEnabled(app, settings)).map((app) =>
         appWithPaperclipCloudConnectorAvailability(app, advertisedProfiles)
-      ),
+      ), ...await aiConnectionRouterService(db).catalog()],
     });
   });
 
@@ -872,6 +893,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
     const resumedConnection = retainedConnectionId
       ? await svc.getConnection(retainedConnectionId, companyId)
       : null;
+    if (resumedConnection) await assertToolConnectionConfigureAccess(req, resumedConnection);
     const effectiveGrantKind = resumedConnection
       ? resumedConnection.credentialPolicy === "per_user"
         ? "user"
@@ -902,6 +924,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
           const personalSubjectUserId = req.body.grantKind === "user" ? req.actor.userId ?? null : null;
           const dedicatedSubjectAgentId = req.body.grantKind === "agent" ? req.body.subjectAgentId ?? null : null;
           const start = await svc.startOAuth(companyId, result.connectionId, {
+            workspaceServices: req.body.workspaceServices,
             redirectUri: oauthRedirectUri(req),
             actor: getActorInfo(req),
             ...(personalSubjectUserId ? { subjectUserId: personalSubjectUserId } : {}),
@@ -988,6 +1011,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
       await assertToolConnectionConfigureAccess(req, existing);
     }
     const result = await svc.startOAuth(existing.companyId, existing.id, {
+      workspaceServices: req.body.workspaceServices,
       redirectUri: oauthRedirectUri(req),
       actor: getActorInfo(req),
       returnTo: oauthBrowserOrigin(req) ?? undefined,
@@ -1331,6 +1355,13 @@ function connectorEnrollmentPrincipal(req: Request): string {
       await assertToolConnectionConfigureAccess(req, pendingConnection);
     }
     const acceptsHtml = req.get("accept")?.includes("text/html") === true;
+    if (acceptsHtml && isCrossSiteOAuthCallbackNavigation(req)) {
+      // State is only peeked above, so the same-origin repeat still owns it.
+      res.set("Cache-Control", "no-store");
+      res.set("Referrer-Policy", "no-referrer");
+      res.type("html").send(oauthCallbackInterstitialHtml(req.originalUrl));
+      return;
+    }
     let result: Awaited<ReturnType<typeof svc.completeOAuthCallback>>;
     try {
       result = await svc.completeOAuthCallback({
@@ -1655,6 +1686,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
           status: connection.status,
           enabled: connection.enabled,
           credentialRefCount: (connection.credentialRefs ?? []).length + connection.credentialSecretRefs.length,
+          ...(req.body.agentInstructions !== undefined ? { agentInstructionsChanged: true, agentInstructionsEnabled: connection.agentInstructions?.enabled ?? false } : {}),
         },
       });
       res.status(201).json(connection);
@@ -2002,6 +2034,68 @@ function connectorEnrollmentPrincipal(req: Request): string {
     res.json({ access: accessSummary });
   });
 
+  async function composioAppManager(req: Request, res: Response) {
+    assertBoard(req);
+    const connection = await getAccessibleResource(req, res, svc.getConnection(req.params.connectionId as string), "Tool connection not found");
+    if (!connection) return null;
+    if (!await isToolConnectionManager(req, connection.companyId)) throw forbidden("Only a connection manager can configure apps and grant agent access");
+    return connection;
+  }
+
+  router.get("/tool-connections/:connectionId/aggregator/apps", async (req, res) => {
+    const connection = await composioAppManager(req, res);
+    if (!connection) return;
+    res.set("Cache-Control", "private, no-store");
+    res.json(await svc.listAggregatorApps(connection.id, { actorType: "user", actorId: req.actor.userId ?? "board" }));
+  });
+  router.post("/tool-connections/:connectionId/aggregator/apps/sync", validate(aggregatorAppsSyncSchema), async (req, res) => {
+    const connection = await composioAppManager(req, res);
+    if (!connection) return;
+    res.json(await svc.syncAggregatorApps(connection.id, req.body.force, { actorType: "user", actorId: req.actor.userId ?? "board" }));
+  });
+  router.post("/tool-connections/:connectionId/aggregator/apps/refresh", validate(aggregatorAppsRefreshSchema), async (req, res) => {
+    const connection = await composioAppManager(req, res);
+    if (!connection) return;
+    res.json(await svc.refreshAggregatorApps(connection.id, req.body.toolkits, { actorType: "user", actorId: req.actor.userId ?? "board" }));
+  });
+  router.put("/tool-connections/:connectionId/aggregator/discovery", validate(arcadeDiscoverySetupSchema), async (req, res) => {
+    const connection = await composioAppManager(req, res);
+    if (!connection) return;
+    res.json(await svc.configureArcadeDiscovery(connection.id, req.body, { actorType: "user", actorId: req.actor.userId ?? "board" }));
+  });
+
+  router.get("/tool-connections/:connectionId/composio/apps", async (req, res) => {
+    const connection = await composioAppManager(req, res);
+    if (!connection) return;
+    res.json(await svc.listComposioApps(connection.id, { actorType: "user", actorId: req.actor.userId ?? "board" }));
+  });
+
+  router.post("/tool-connections/:connectionId/composio/apps/sync", validate(composioAppsSyncSchema), async (req, res) => {
+    const connection = await composioAppManager(req, res);
+    if (!connection) return;
+    res.json(await svc.syncComposioApps(connection.id, req.body.force, { actorType: "user", actorId: req.actor.userId ?? "board" }));
+  });
+
+  router.post("/tool-connections/:connectionId/composio/apps/refresh", validate(composioAppsRefreshSchema), async (req, res) => {
+    const connection = await composioAppManager(req, res);
+    if (!connection) return;
+    res.json(await svc.refreshComposioApps(connection.id, req.body.toolkits, { actorType: "user", actorId: req.actor.userId ?? "board" }));
+  });
+
+  router.post("/tool-connections/:connectionId/composio/apps/:toolkit/accounts", validate(composioAppAccountSchema), async (req, res) => {
+    const connection = await composioAppManager(req, res);
+    if (!connection) return;
+    res.json(await svc.manageComposioAppAccount(connection.id, req.params.toolkit as string, req.body, { actorType: "user", actorId: req.actor.userId ?? "board" }));
+  });
+
+  router.post("/tool-connections/:connectionId/composio/apps/:toolkit/setup", validate(composioAppSetupSchema), async (req, res) => {
+    const connection = await composioAppManager(req, res);
+    if (!connection) return;
+    const result = await svc.setupComposioApp(connection.id, req.params.toolkit as string, req.body,
+      { actorType: "user", actorId: req.actor.userId ?? "board" });
+    res.json(result);
+  });
+
   router.post("/tool-connections/:connectionId/test-calls", validate(toolConnectionTestCallSchema), async (req, res) => {
     assertBoard(req);
     if (!options.toolGateway) {
@@ -2052,6 +2146,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
     const existing = await getAccessibleResource(req, res, svc.getConnection(req.params.connectionId as string), "Tool connection not found");
     if (!existing) return;
     await assertToolConnectionConfigureAccess(req, existing);
+    if (aiConnectionRouterPluginKey(existing)) throw badRequest("Update this connection pool through its pool settings.");
     const connection = await svc.updateConnection(existing.id, req.body);
     const lifecycleChanges = classifyConnectionUpdate(
       { enabled: existing.enabled, config: existing.config },
@@ -2071,6 +2166,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
         details: {
           status: connection.status,
           enabled: connection.enabled,
+          ...(req.body.agentInstructions !== undefined ? { agentInstructionsChanged: true, agentInstructionsEnabled: connection.agentInstructions?.enabled ?? false } : {}),
           credentialRefCount: (connection.credentialRefs ?? []).length + connection.credentialSecretRefs.length,
         },
       });
@@ -2083,6 +2179,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
           details: {
             status: connection.status,
             enabled: connection.enabled,
+          ...(req.body.agentInstructions !== undefined ? { agentInstructionsChanged: true, agentInstructionsEnabled: connection.agentInstructions?.enabled ?? false } : {}),
             lifecycle: change.lifecycle,
             ...change.details,
           },
@@ -2096,6 +2193,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
     const existing = await getAccessibleResource(req, res, svc.getConnection(req.params.connectionId as string), "Tool connection not found");
     if (!existing) return;
     await assertToolConnectionConfigureAccess(req, existing);
+    if (aiConnectionRouterPluginKey(existing)) throw badRequest("Remove this connection pool through its revision-checked pool settings.");
     const applicationBefore = await svc.getApplication(existing.applicationId);
     const { connection, removal } = await svc.archiveConnection(
       existing.id,
@@ -2187,7 +2285,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
     assertBoard(req);
     const existing = await getAccessibleResource(req, res, svc.getConnection(req.params.connectionId as string), "Tool connection not found");
     if (!existing) return;
-    res.json({ catalog: await svc.listCatalog(existing.id, existing.companyId) });
+    res.json({ catalog: await svc.listCatalog(existing.id, existing.companyId, getActorInfo(req)) });
   });
 
   router.get("/tool-connections/:connectionId/activity", async (req, res) => {

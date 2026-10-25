@@ -31,6 +31,7 @@ import {
 import { renderRunnerHistoryIndex } from "./history-index.js";
 import { renderPublicCampaignSummary } from "./public-summary-image.js";
 import { isPublicRunnerScreenshotRoute } from "./screenshot-policy.js";
+import { connectionCheckpoints, type ConnectionEvidence } from "./connection-evidence.js";
 import type { MatrixExecution, RunnerE2EResult } from "./types.js";
 
 const temporaryDirectories: string[] = [];
@@ -63,10 +64,46 @@ function result(execution: MatrixExecution, status: "passed" | "failed") {
     finishedAt: "2026-08-28T00:00:01.000Z",
     durationMs: 1_000,
     cleanup: "passed",
+    ...(execution.task.flow === "provider_connection" ? { providerConnection: { version: 1, outcome: status, phase: "finished", assisted: false, authFreshness: "signed-in", target: { mode: "attach", origin: "http://127.0.0.1:3100", commit: "a".repeat(40), deploymentMode: "local_trusted" }, entry: "agent", method: "api-key", checkpoints: Object.fromEntries(connectionCheckpoints.map(key => [key, true])), waits: [] } satisfies ConnectionEvidence } : {}),
   } satisfies RunnerE2EResult;
 }
 
 describe("runner E2E campaign history", () => {
+  it("retains the supervisor trace outcome independently of the worker export through regeneration", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "runner-finalized-trace-"));
+    temporaryDirectories.push(root);
+    const execution = runnerMatrix[0]!;
+    const attempt: RunnerE2EResult = { ...result(execution, "failed"), failureClass: "permanent_infrastructure",
+      tracing: { projectId: "11111111-1111-4111-8111-111111111111", traceId: "a".repeat(32), spanId: "b".repeat(16),
+        status: "accepted", verification: "unverified", nativeConfiguration: "configured",
+        finalization: { spanId: "c".repeat(16), status: "accepted", outcome: "failed", verification: "unverified" } },
+    };
+    const campaign = buildRunnerCampaign({ campaignId: "finalized-trace", generatedAt: attempt.finishedAt,
+      expected: [execution.id], results: [attempt], attempts: [attempt] });
+    await writeFile(path.join(root, "normalized-results.json"), JSON.stringify(campaign));
+    await regenerateRunnerDashboard({ bundle: root, historyFile: null });
+    const rebuilt = JSON.parse(await readFile(path.join(root, "normalized-results.json"), "utf8"));
+    expect(rebuilt.results[0].tracing).toEqual(attempt.tracing);
+    expect(rebuilt.accounting.attempts[0].tracing).toEqual(attempt.tracing);
+    expect(rebuilt.failed).toBe(1);
+    expect(await readFile(path.join(root, "dashboard.html"), "utf8")).toContain("Supervisor outcome: failed; finalization export: accepted");
+  });
+
+  it("preserves all-attempt costs when regenerating a retained report", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "runner-attempt-costs-"));
+    temporaryDirectories.push(root);
+    const execution = runnerMatrix[0]!;
+    const first = result(execution, "failed");
+    const last = { ...result(execution, "passed"), attempt: 2, usage: { inputTokens: 200, outputTokens: 50, costUsd: 0.02 } };
+    const campaign = buildRunnerCampaign({ campaignId: "retries", generatedAt: last.finishedAt,
+      expected: [execution.id], results: [last], attempts: [first, last] });
+    await writeFile(path.join(root, "normalized-results.json"), JSON.stringify(campaign));
+    await regenerateRunnerDashboard({ bundle: root });
+    const regenerated = JSON.parse(await readFile(path.join(root, "normalized-results.json"), "utf8"));
+    expect(regenerated.accounting).toEqual(campaign.accounting);
+    expect(regenerated.billing.reportedLlmCostUsd).toBe(0.03);
+    expect(regenerated.results[0].billing.reportedCostUsd).toBe(0.02);
+  });
   it("does not let empty legacy provenance hide a later measured source", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "runner-legacy-source-"));
     temporaryDirectories.push(root);
@@ -135,7 +172,7 @@ describe("runner E2E campaign history", () => {
     expect(history.latestGreenCampaignId).toBeNull();
     expect(history.latestGreenBySuite["first-task"]).toBeUndefined();
     expect(renderRunnerHistoryIndex(history)).toContain("1 incomplete");
-    expect(renderRunnerE2EDashboard({ title: "History", generatedAt: incomplete.finishedAt, expected: [], catalog: [], entries: [], history })).toContain('data-history-status="incomplete"');
+    expect(renderRunnerHistoryIndex(history)).toContain('data-history-status="incomplete"');
   });
 
   it("shows unknown campaign costs without plotting zero dollars", () => {
@@ -145,9 +182,9 @@ describe("runner E2E campaign history", () => {
     const record = { ...campaignHistoryRecord(campaign, "https://example.test"), complete: true };
     const history = mergeRunnerHistory(null, record);
     expect(renderRunnerHistoryIndex(history)).toContain("Unknown");
-    const dashboard = renderRunnerE2EDashboard({ title: "History", generatedAt: campaign.generatedAt, expected: [], catalog: [], entries: [], history });
-    expect(dashboard).toContain("Unknown measurements are not plotted");
-    expect(dashboard).not.toContain("NaN");
+    const index = renderRunnerHistoryIndex(history);
+    expect(index).toContain("Unknown measurements are not plotted");
+    expect(index).not.toContain("NaN");
   });
 
   it("does not turn a clean-evidence behavior failure into a pass when regenerating", async () => {
@@ -164,6 +201,9 @@ describe("runner E2E campaign history", () => {
   });
 
   it("records the resolved paid target instead of the trusted workflow checkout", () => {
+    vi.stubEnv("GITHUB_SERVER_URL", "");
+    vi.stubEnv("GITHUB_REPOSITORY", "");
+    vi.stubEnv("GITHUB_RUN_ID", "");
     vi.stubEnv("PAPERCLIP_RUNNER_E2E_SOURCE_SHA", "target-sha");
     vi.stubEnv("PAPERCLIP_RUNNER_E2E_SOURCE_REF", "refs/heads/target");
     vi.stubEnv("GITHUB_SHA", "trusted-master-sha");
@@ -269,34 +309,33 @@ describe("runner E2E campaign history", () => {
         errors: campaignResult.status === "passed" ? [] : ["failed"],
       })),
     });
-    expect(dashboard).toContain("Campaign trends");
-    expect(dashboard).toContain("data-history-from");
-    expect(dashboard).toContain("data-history-through");
-    expect(dashboard).toContain(
+    expect(dashboard).not.toContain('class="history-section"');
+    const index = renderRunnerHistoryIndex(history);
+    expect(index).toContain("Campaign trends");
+    expect(index).toContain("data-history-from");
+    expect(index).toContain("data-history-through");
+    expect(index).toContain(
       'data-history-suite-trends="core-compatibility"',
     );
-    expect(dashboard).toContain(
+    expect(index).toContain(
       'data-history-suite-trends="openrouter-model-breadth"',
     );
-    expect(dashboard).toContain(
+    expect(index).toContain(
       'data-history-suite-trends="local-session-integrity"',
     );
-    expect(dashboard).toContain("Suite pass rate");
-    expect(dashboard).toContain("lines break at definition changes");
-    expect(dashboard).toContain("cleanup passed");
-    const index = renderRunnerHistoryIndex(history, {
-      latestSummaryImageHref:
-        "campaigns/complete-red/public-images/campaign-summary.png",
-    });
+    expect(index).toContain("Suite pass rate");
+    expect(index).toContain("lines break at definition changes");
+    expect(index).toContain("cleanup passed");
     expect(index).toContain("Runner E2E campaigns");
     expect(index).toContain("complete-green");
     expect(index).toContain("complete-red");
     expect(index).toContain(`${runnerMatrix.length}/${runnerMatrix.length} passed`);
     expect(index).toContain(`${runnerMatrix.length - 1}/${runnerMatrix.length} passed`);
     expect(index).toContain("Open report&nbsp;→");
-    expect(index).toContain(
-      "campaigns/complete-red/public-images/campaign-summary.png",
-    );
+    expect(index).toContain('aria-label="Latest campaign summary"');
+    expect(index).toContain('aria-label="Suite results"');
+    expect(index).toContain("Core Runner Compatibility</a>");
+    expect(index).not.toContain("campaign-summary.png");
     expect(index).toContain(
       "declared screenshots, and normalized results",
     );
@@ -600,11 +639,11 @@ describe("historical publication security", () => {
     ).toBe(true);
     await regenerateRunnerDashboard({
       bundle: root,
-      publicSummaryImageHref: "public-images/campaign-summary.png",
     });
-    expect(await readFile(path.join(root, "index.html"), "utf8")).toContain(
-      'src="public-images/campaign-summary.png"',
-    );
+    const dashboardHtml = await readFile(path.join(root, "index.html"), "utf8");
+    expect(dashboardHtml).toContain('aria-label="Suite results"');
+    expect(dashboardHtml).toContain(`${execution.suite.label}</a>`);
+    expect(dashboardHtml).not.toContain('src="public-images/campaign-summary.png"');
     const manifest = await createBundleManifest(
       root,
       campaign.campaignId,

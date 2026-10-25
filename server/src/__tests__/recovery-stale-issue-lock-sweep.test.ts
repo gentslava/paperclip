@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  costEvents,
   activityLog,
   agents,
   companies,
@@ -54,6 +55,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     await db.delete(issueRelations);
     await db.delete(activityLog);
     await db.delete(heartbeatRunEvents);
+    await db.delete(costEvents);
     await db.delete(heartbeatRuns);
     await db.delete(completionContracts);
     await db.delete(issues);
@@ -109,6 +111,31 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
 
     return { companyId, agentId, failedRunId, runningRunId };
   }
+
+  it.each([true, false])("preserves explicit retry ownership when finalization wins the sweep write (settler: %s)", async withSettler => {
+    const { companyId, agentId, runningRunId, failedRunId } = await seed();
+    const issueId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId, title: "Retry finalization race",
+      status: "in_progress", assigneeAgentId: agentId, executionRunId: runningRunId });
+    await db.update(heartbeatRuns).set({ processPid: 2_000_000_000,
+      contextSnapshot: { issueId, explicitUserContinuation: { previousRunId: failedRunId, commentId: randomUUID() } },
+    }).where(eq(heartbeatRuns.id, runningRunId));
+    const beforeOrphanedRunTerminalWrite = vi.fn(async () => {
+      await db.update(heartbeatRuns).set({ status: "timed_out", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, runningRunId));
+    });
+    const settleExplicitContinuationRetry = vi.fn(async () => {});
+    const result = await recoveryService(db, { enqueueWakeup: vi.fn(), beforeOrphanedRunTerminalWrite,
+      ...(withSettler ? { settleExplicitContinuationRetry } : {}),
+    }).sweepStaleIssueLocks();
+    expect(beforeOrphanedRunTerminalWrite).toHaveBeenCalledOnce();
+    expect(result).toEqual({ cleared: 0, issueIds: [], terminalizedRunIds: [] });
+    expect(settleExplicitContinuationRetry).toHaveBeenCalledTimes(withSettler ? 1 : 0);
+    if (withSettler) expect(settleExplicitContinuationRetry).toHaveBeenCalledWith(expect.objectContaining({
+      id: runningRunId, status: "timed_out",
+    }));
+    expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]!.executionRunId).toBe(runningRunId);
+  });
 
   it("clears lock columns when checkoutRunId points at a terminal heartbeat run", async () => {
     const { companyId, agentId, failedRunId } = await seed();
@@ -220,6 +247,95 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
         .where(eq(heartbeatRuns.id, runningRunId))
         .then((rows) => rows[0]?.status),
     ).resolves.toBe("running");
+  });
+
+  async function seedCompletedOnboardingReport(options: {
+    runtimeMode?: "native" | "legacy";
+    variant?: "ordinary" | "cancelled" | "wrong_child" | "wrong_reason" | "wrong_agent" | "unfinished_child" | "foreign_child";
+  } = {}) {
+    const { companyId, agentId, runningRunId } = await seed();
+    const issueId = randomUUID();
+    const childIssueId = randomUUID();
+    const variant = options.variant;
+    let childCompanyId = companyId;
+    if (variant === "foreign_child") {
+      childCompanyId = randomUUID();
+      await db.insert(companies).values({
+        id: childCompanyId,
+        name: "Other company",
+        issuePrefix: `T${childCompanyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      });
+    }
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Completed onboarding awaiting its child result",
+      originKind: variant === "ordinary" ? "manual" : "onboarding_first_task",
+      status: variant === "cancelled" ? "cancelled" : "done",
+      assigneeAgentId: variant === "wrong_agent" ? null : agentId,
+      checkoutRunId: runningRunId,
+      executionRunId: runningRunId,
+      executionLockedAt: new Date(),
+    });
+    await db.insert(issues).values({
+      id: childIssueId,
+      companyId: childCompanyId,
+      title: "Accepted child output",
+      status: variant === "unfinished_child" ? "in_progress" : "done",
+      parentId: variant === "foreign_child" ? null : issueId,
+    });
+    await db.update(heartbeatRuns).set({
+      runtimeMode: options.runtimeMode ?? "native",
+      nativeIssueId: options.runtimeMode === "legacy" ? null : issueId,
+      processPid: 2_000_000_000,
+      contextSnapshot: {
+        issueId,
+        wakeReason: variant === "wrong_reason" ? "issue_commented" : "issue_children_completed",
+        completedChildIssueId: variant === "wrong_child" ? randomUUID() : childIssueId,
+        onboardingCompletion: true,
+      },
+    }).where(eq(heartbeatRuns.id, runningRunId));
+    return { companyId, agentId, issueId, childIssueId, runningRunId };
+  }
+
+  it.each(["native", "legacy"] as const)("preserves a live %s completed-onboarding reporting turn during delayed startup", async runtimeMode => {
+    const { issueId, runningRunId } = await seedCompletedOnboardingReport({ runtimeMode });
+    const result = await recoveryService(db, {
+      enqueueWakeup: vi.fn(),
+      liveRunExecutions: new Set([runningRunId]),
+    }).sweepStaleIssueLocks();
+
+    expect(result).toEqual({ cleared: 0, issueIds: [], terminalizedRunIds: [] });
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runningRunId)))[0]?.status).toBe("running");
+    expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]).toMatchObject({
+      status: "done", checkoutRunId: runningRunId, executionRunId: runningRunId,
+    });
+    expect(mockTelemetryClient.track).not.toHaveBeenCalled();
+  });
+
+  it.each(["ordinary", "cancelled", "wrong_child", "wrong_reason", "wrong_agent", "unfinished_child", "foreign_child"] as const)("does not exempt an invalid completed-onboarding reporting turn (%s)", async variant => {
+    const { issueId, runningRunId } = await seedCompletedOnboardingReport({ variant });
+    const result = await recoveryService(db, {
+      enqueueWakeup: vi.fn(),
+      liveRunExecutions: new Set([runningRunId]),
+    }).sweepStaleIssueLocks();
+
+    expect(result.terminalizedRunIds).toEqual([runningRunId]);
+    expect(result.cleared).toBe(1);
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runningRunId)))[0]?.status).toBe(variant === "cancelled" ? "cancelled" : "succeeded");
+    expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]).toMatchObject({ checkoutRunId: null, executionRunId: null });
+  });
+
+  it("still interrupts a completed-onboarding reporting turn after its process and execution owner are gone", async () => {
+    const { issueId, runningRunId } = await seedCompletedOnboardingReport();
+    const result = await recoveryService(db, { enqueueWakeup: vi.fn() }).sweepStaleIssueLocks();
+
+    expect(result.terminalizedRunIds).toEqual([runningRunId]);
+    expect(result.cleared).toBe(1);
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runningRunId)))[0]).toMatchObject({
+      status: "interrupted", errorCode: "orphaned_running_run",
+    });
+    expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]).toMatchObject({ checkoutRunId: null, executionRunId: null });
   });
 
   it("does not clear when checkoutRunId is terminal but executionRunId is still running", async () => {
@@ -933,27 +1049,34 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     // Make only the audit-event insert fail. The run update commits the
     // terminal status first, so the audit write is best-effort. The sweep must
     // catch the failure and still clear the lock.
-    const transactionSpy = vi
-      .spyOn(db, "transaction")
-      .mockRejectedValueOnce(new Error("simulated audit write failure"));
+    await db.execute(sql`
+      create function reject_stale_lock_audit() returns trigger language plpgsql as $$
+      begin raise exception 'simulated audit write failure'; end;
+      $$
+    `);
 
     try {
+      await db.execute(sql`
+        create trigger reject_stale_lock_audit before insert on heartbeat_run_events
+        for each row execute function reject_stale_lock_audit()
+      `);
       const heartbeat = heartbeatService(db);
       const result = await heartbeat.sweepStaleIssueLocks();
 
       expect(result.terminalizedRunIds).toEqual([runningRunId]);
       expect(result.cleared).toBe(1);
     } finally {
-      transactionSpy.mockRestore();
+      await db.execute(sql`drop trigger if exists reject_stale_lock_audit on heartbeat_run_events`);
+      await db.execute(sql`drop function reject_stale_lock_audit()`);
     }
 
     // The run reached its terminal status even though the audit write failed.
     const runStatus = await db
-      .select({ status: heartbeatRuns.status })
+      .select({ status: heartbeatRuns.status, nextEventSeq: heartbeatRuns.nextEventSeq })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runningRunId))
-      .then((rows) => rows[0]?.status);
-    expect(runStatus).toBe("interrupted");
+      .then((rows) => rows[0]);
+    expect(runStatus).toEqual({ status: "interrupted", nextEventSeq: 1 });
 
     // The sweep cleared the lock in the same pass.
     const lock = await db

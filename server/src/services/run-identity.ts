@@ -10,6 +10,7 @@ import {
   type Db,
 } from "@paperclipai/db";
 import { conflict, forbidden } from "../errors.js";
+import { boundRunIssueId, runTaskContextColumn } from "./run-task-binding.js";
 import { isUuidLike } from "@paperclipai/shared";
 import { queuedCommentIdsFromRunContext, queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
 
@@ -57,7 +58,13 @@ export async function explicitOperatorRunIdentity(
 export type RunIdentityContext = typeof runIdentityContexts.$inferSelect;
 type Executor = Pick<Db, "select" | "insert" | "update">;
 
-/** Match task mutation ordering: lock the task before the run, never the reverse. */
+/**
+ * Lock the task before the run, matching task mutation ordering. Identity
+ * operations do not change parent keys: NO KEY UPDATE still serializes writers
+ * and steering, while allowing audit inserts to check their foreign keys.
+ * FOR UPDATE can deadlock with an append that holds KEY SHARE on the run and
+ * then checks the task while identity capture holds the task and waits on the run.
+ */
 async function lockIdentityTask(
   executor: Pick<Db, "select">,
   companyId: string,
@@ -65,19 +72,18 @@ async function lockIdentityTask(
 ) {
   const [run] = await executor
     .select({
-      context: heartbeatRuns.contextSnapshot,
-      issueId: heartbeatRuns.nativeIssueId,
+      contextSnapshot: runTaskContextColumn,
+      nativeIssueId: heartbeatRuns.nativeIssueId,
+      issueId: heartbeatRuns.issueId,
     })
     .from(heartbeatRuns)
     .where(
       and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, companyId)),
     );
-  const issueId = run?.context?.issueId ?? run?.context?.taskId ?? run?.issueId;
-  if (
-    issueId !== undefined &&
-    issueId !== null &&
-    (typeof issueId !== "string" || !isUuidLike(issueId))
-  ) {
+  const issueId = run?.nativeIssueId ?? run?.issueId ?? run?.contextSnapshot?.issueId ?? run?.contextSnapshot?.taskId;
+  const legacyIssueId = run?.contextSnapshot?.issueId ?? run?.contextSnapshot?.taskId;
+  if ([issueId, legacyIssueId].some(id => id !== undefined && id !== null &&
+      (typeof id !== "string" || !isUuidLike(id)))) {
     throw forbidden("Run task identity is invalid");
   }
   if (typeof issueId === "string")
@@ -85,7 +91,7 @@ async function lockIdentityTask(
       .select({ id: issues.id })
       .from(issues)
       .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
-      .for("update");
+      .for("no key update");
 }
 
 async function append(
@@ -144,8 +150,12 @@ async function activate(executor: Executor, context: RunIdentityContext) {
         eq(heartbeatRuns.companyId, context.companyId),
       ),
     )
-    .returning();
-  const issueId = run?.contextSnapshot?.issueId ?? run?.contextSnapshot?.taskId;
+    .returning({
+      nativeIssueId: heartbeatRuns.nativeIssueId,
+      issueId: heartbeatRuns.issueId,
+      contextSnapshot: runTaskContextColumn,
+    });
+  const issueId = run ? boundRunIssueId(run) : null;
   if (typeof issueId === "string")
     await executor
       .update(issues)
@@ -181,7 +191,7 @@ export async function initializeRunIdentity(
           eq(heartbeatRuns.companyId, input.companyId),
         ),
       )
-      .for("update");
+      .for("no key update");
     if (!run) throw forbidden("Run identity does not belong to this company");
     if (run.activeIdentityContextId) {
       const [current] = await tx
@@ -313,8 +323,7 @@ export async function prepareSteeredIdentity(
     throw forbidden("Steering requires an authenticated message author");
   if (
     run.status !== "running" ||
-    (run.contextSnapshot?.issueId !== input.issueId &&
-      run.contextSnapshot?.taskId !== input.issueId)
+    boundRunIssueId(run) !== input.issueId
   ) {
     throw conflict("Steering targets a different or inactive execution");
   }
@@ -345,7 +354,7 @@ export async function reserveSteeredIdentity(
           eq(heartbeatRuns.companyId, input.companyId),
         ),
       )
-      .for("update");
+      .for("no key update");
     // Processes started before the broker rollout keep their original environment.
     if (!run?.activeIdentityContextId) return null;
     const [pending] = await tx
@@ -439,7 +448,7 @@ export async function captureRunIdentity(
           eq(heartbeatRuns.agentId, input.agentId),
         ),
       )
-      .for("update");
+      .for("no key update");
     if (!run || run.status !== "running")
       throw forbidden(
         "Credential acquisition requires this agent's active run",
@@ -512,7 +521,7 @@ export async function reconcileSteeredIdentity(
           eq(heartbeatRuns.companyId, context.companyId),
         ),
       )
-      .for("update");
+      .for("no key update");
     if (!run) return;
     await acceptSteeredIdentity(tx, context);
   });

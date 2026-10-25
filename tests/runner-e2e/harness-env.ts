@@ -1,3 +1,6 @@
+import { installedDaytonaPluginKeys } from "./installed-daytona-plugin.js";
+import { QUALIFIED_ACPX_PROFILES } from "../../packages/paperclip-runner/src/drivers/acpx/qualified-profiles.js";
+import { assertInstalledCliSelection, installedCliKeys, usesInstalledCli } from "./installed-cli.js";
 import path from "node:path";
 import { chatNeedsApiTools, isManagedHiringCase } from "./chat-cases.js";
 import { CREDENTIAL_NAMES } from "./types.js";
@@ -8,6 +11,9 @@ const AMBIENT_PAPERCLIP_CREDENTIAL_KEYS = [
   "PAPERCLIP_API_KEY",
   "PAPERCLIP_AGENT_API_KEY",
   "PAPERCLIP_TASK_BRIDGE_TOKEN",
+  "PAPERCLIP_E2E_GATEWAY_TOKEN",
+  "PAPERCLIP_E2E_GATEWAY_PHASE_PATH",
+  "PAPERCLIP_E2E_OTLP_RELAY_URL",
   "PAPERCLIP_SETUP_TOKEN",
   "PAPERCLIP_SECRETS_MASTER_KEY",
   "PAPERCLIP_SECRETS_MASTER_KEY_FILE",
@@ -25,7 +31,25 @@ const AMBIENT_EXTERNAL_STATE_KEYS = [
   "PAPERCLIP_STORAGE_S3_PREFIX",
   "PAPERCLIP_STORAGE_S3_FORCE_PATH_STYLE",
 ] as const;
-const PROVIDER_SECRET_KEY = /^(?:OPENAI|ANTHROPIC|OPENROUTER|DAYTONA)(?:_|$)/;
+const PROVIDER_SECRET_KEY = /^(?:OPENAI|ANTHROPIC|OPENROUTER|BRAINTRUST|DAYTONA|XAI|GROK|CURSOR|COPILOT|GITHUB|GH)(?:_|$)/;
+
+export function applyEvalGatewayEnvironment(env: NodeJS.ProcessEnv, credential: string, gateway: {
+  token: string; baseUrl: string; phasePath: string; observability?: { token: string; baseUrl: string };
+}) {
+  for (const name of Object.keys(env)) {
+    if (CREDENTIAL_NAMES.includes(name as typeof CREDENTIAL_NAMES[number])
+      || PROVIDER_SECRET_KEY.test(name) && /KEY|TOKEN|SECRET|PASSWORD/.test(name)) delete env[name];
+  }
+  delete env.PAPERCLIP_E2E_OTLP_RELAY_URL;
+  env[credential] = gateway.token;
+  env.PAPERCLIP_E2E_GATEWAY_BASE_URL = gateway.baseUrl;
+  env.PAPERCLIP_E2E_GATEWAY_TOKEN = gateway.token;
+  env.PAPERCLIP_E2E_GATEWAY_PHASE_PATH = gateway.phasePath;
+  if (gateway.observability) {
+    env.BRAINTRUST_API_KEY = gateway.observability.token;
+    env.PAPERCLIP_E2E_OTLP_RELAY_URL = gateway.observability.baseUrl;
+  }
+}
 
 export function runnerE2EServerControlPaths(temporaryRoot: string) {
   const controlDirectory = path.join(temporaryRoot, "control");
@@ -104,10 +128,44 @@ export function buildRunnerE2EProcessEnvironment(
   source: NodeJS.ProcessEnv,
   executions: readonly MatrixExecution[],
 ): NodeJS.ProcessEnv {
+  const installed = usesInstalledCli(source);
+  if (installed) assertInstalledCliSelection(source, executions);
   const result = { ...source };
+  delete result.PAPERCLIP_E2E_GATEWAY_PHASE_PATH;
+  delete result.PAPERCLIP_E2E_OTLP_RELAY_URL;
   // Announcements are unrelated to the scenarios and obscure screenshot evidence.
   result.PAPERCLIP_ANNOUNCEMENTS_ENABLED = "false";
   delete result.OPENCODE_ALLOW_ALL_MODELS;
+  // Discard ambient admission. Only explicit candidate cells authorize the
+  // exact model in their isolated server; credentials still use company secrets.
+  delete result.PAPERCLIP_RUNNER_ACPX_QUALIFICATION;
+  const candidates = new Map<string, string>();
+  for (const execution of executions) {
+    const agent = execution.profile.qualificationCandidate;
+    if (!agent) continue;
+    const admittedSuite = execution.suite.id === "extended-harnesses"
+      || execution.suite.id === "rich-acp-warm-continuity"
+      || (execution.suite.id === "pi-native" && agent === "pi")
+      || (execution.suite.id === "pi-controls" && agent === "pi")
+      || (["cursor-native", "native-provider-loss"].includes(execution.suite.id) && agent === "cursor")
+      || (["copilot-protection", "copilot-provider-death"].includes(execution.suite.id) && agent === "copilot")
+      || (execution.suite.id === "native-active-stop" && (agent === "cursor" || agent === "copilot"));
+    if (!admittedSuite || !execution.suite.manualOnly) {
+      throw new Error("Candidate qualification requires an explicit provider qualification suite");
+    }
+    if (QUALIFIED_ACPX_PROFILES[agent].qualificationStatus !== "pending") {
+      continue;
+    }
+    const prior = candidates.get(agent);
+    if (prior !== undefined && prior !== execution.profile.model) throw new Error("Conflicting candidate models");
+    candidates.set(agent, execution.profile.model);
+  }
+  // Installed lanes must prove normal production admission without candidate overrides.
+  if (candidates.size > 0 && !installed) {
+    result.PAPERCLIP_RUNNER_ACPX_QUALIFICATION = JSON.stringify(
+      [...candidates].map(([agent, model]) => ({ agent, model })),
+    );
+  }
   // These stories explicitly require the native API surface. Other suites
   // retain the server default or any supplied operator restriction.
   if (executions.some((e) => isManagedHiringCase(e.suite.id, e.task.id) || chatNeedsApiTools(e.suite.id, e.task.id))) {
@@ -129,7 +187,8 @@ export function buildRunnerE2EProcessEnvironment(
 /**
  * Build the environment inherited by the Paperclip server. Paid credentials
  * deliberately stay in the launcher/Playwright process and cross the server
- * boundary only once, in the encrypted company-secrets API request.
+ * boundary through encrypted company secrets. Explicit subscription fixtures
+ * stage their login in the disposable company's private credential home.
  */
 export function buildPaperclipServerEnvironment(
   source: NodeJS.ProcessEnv,
@@ -147,7 +206,7 @@ export function buildPaperclipServerEnvironment(
   ]) {
     delete result[key];
   }
-  for (const key of GENERATED_SERVER_SECRET_KEYS) delete result[key];
+  for (const key of [...GENERATED_SERVER_SECRET_KEYS, ...installedCliKeys, ...installedDaytonaPluginKeys]) delete result[key];
   Object.assign(result, overrides);
   return result;
 }

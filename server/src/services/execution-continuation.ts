@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { and, asc, desc, eq, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
@@ -14,6 +15,8 @@ import { sanitizeQuarantinedCommentForHigherTrust } from "./source-trust.js";
 import { hasConversationContinuationPolicy } from "./conversation-continuation.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
 import { childReviewOutcomes } from "./native-runtime/child-review-outcomes.js";
+import { isCompletedOnboardingHandoffWake } from "./chat-completion-delivery.js";
+import { githubRecoveryReceipts } from "./chat-channels/github/recovery-receipts.js";
 
 export class StaleExecutionContinuationError extends Error {
   constructor(readonly code: "continuation_task_ownership_changed") {
@@ -44,6 +47,33 @@ export function continuationOriginCommentIds(context: unknown): string[] {
       ].filter((v): v is string => typeof v === "string" && v.length > 0),
     ),
   ];
+}
+
+/**
+ * Return the comment IDs explicitly represented in a delivered continuation.
+ * An absent list is intentionally different from an empty list: historical or
+ * third-party snapshots cannot prove what the provider received.
+ */
+export function deliveredContinuationCommentIds(context: unknown): {
+  known: boolean;
+  ids: Set<string>;
+} {
+  const c = object(context);
+  const wake = object(c.paperclipWake);
+  const continuation = object(c.executionContinuation);
+  const ids = new Set<string>();
+  let known = false;
+  const collect = (value: unknown) => {
+    if (!Array.isArray(value)) return;
+    known = true;
+    for (const item of value) {
+      const id = typeof item === "string" ? item : string(object(item).id);
+      if (id) ids.add(id);
+    }
+  };
+  collect(wake.comments);
+  collect(continuation.messages);
+  return { known, ids };
 }
 
 /** Keep service/tool results and generated summaries out of human authority. */
@@ -132,7 +162,11 @@ export async function buildExecutionContinuation(input: {
   if (
     !issue ||
     issue.assigneeAgentId !== input.agentId ||
-    ["done", "cancelled"].includes(issue.status)
+    issue.status === "cancelled" ||
+    (issue.status === "done" && !await isCompletedOnboardingHandoffWake(db, {
+      companyId, issueId, agentId: input.agentId,
+      reason: string(input.context.wakeReason), contextSnapshot: input.context,
+    }))
   )
     throw new StaleExecutionContinuationError("continuation_task_ownership_changed");
   const rows = await db
@@ -275,6 +309,12 @@ export async function buildExecutionContinuation(input: {
     (row) =>
       row.authorType === "user" && !row.createdByRunId && !row.deleted && row.body.trim().length > 0,
   );
+  const hashObjectiveSource = (value: string) => createHash("sha256").update(value.trim()).digest("hex");
+  const objectiveSource = latestRequest
+    ? { kind: "comment" as const, id: latestRequest.id, revision: latestRequest.updatedAt }
+    : issue.description !== null && issue.description !== undefined
+      ? { kind: "description" as const, id: issue.id, revision: hashObjectiveSource(issue.description) }
+      : { kind: "title" as const, id: issue.id, revision: hashObjectiveSource(issue.title) };
   const priorRuns = await db
     .select({ id: heartbeatRuns.id, result: heartbeatRuns.resultJson, status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode, runtimeMode: heartbeatRuns.runtimeMode, retryOfRunId: heartbeatRuns.retryOfRunId })
     .from(heartbeatRuns)
@@ -305,6 +345,7 @@ export async function buildExecutionContinuation(input: {
       },
     ),
   );
+  completedActions.push(...await githubRecoveryReceipts(db, companyId, issueId));
   const reconciliations = await db
     .select({
       id: issueRecoveryActions.id,
@@ -352,12 +393,34 @@ export async function buildExecutionContinuation(input: {
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is not null`,
         input.runId ? eq(agentWakeupRequests.runId, input.runId) : undefined,
       )) : [];
-    const authorization = continuationAuthorizations.find(value => failedRunId
+    const taskRetryId = string(explicitContinuation.taskRetryRequestId);
+    const [taskRetryWake] = taskRetryId && z.string().guid().safeParse(taskRetryId).success
+      ? await db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.id, taskRetryId),
+        eq(agentWakeupRequests.agentId, input.agentId), eq(agentWakeupRequests.reason, "task_retry"),
+        eq(agentWakeupRequests.requestedByActorType, "user"), eq(agentWakeupRequests.status, "coalesced"),
+        sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+        input.runId ? eq(agentWakeupRequests.runId, input.runId) : undefined,
+      )) : [];
+    const authorization = continuationAuthorizations.find(value => taskRetryId
+          ? value.taskRetryRequestId === taskRetryId && taskRetryWake?.runId === value.runId &&
+            taskRetryWake.requestedByActorId === value.actorId &&
+            object(taskRetryWake.payload?.taskRetry).sourceRunId === value.previousRunId
+          : failedRunId
           ? value.failedRunId === failedRunId && retryWakes.some(wake =>
               wake.runId === value.runId && wake.requestedByActorId === value.actorId &&
               priorRuns.some(run => run.id === wake.runId && run.retryOfRunId === failedRunId))
           : rows.some(comment => comment.id === value.commentId &&
               comment.authorType === "user" &&
+              (!("commentUpdatedAt" in value || "commentBodyHash" in value || value.automaticRetry) || (
+                value.commentUpdatedAt === comment.updatedAt.toISOString() &&
+                value.commentBodyHash === createHash("sha256").update(comment.body).digest("hex")
+              )) &&
+              (!value.automaticRetry || (
+                object(value.automaticRetry).sourceRunId === explicitUserSource &&
+                comment.body.trim().length > 0 && issue.executionRunId === input.runId &&
+                priorRuns.some(run => run.id === value.runId && run.retryOfRunId === explicitUserSource)
+              )) &&
               (value.queuedCommentInterruptId
                 ? interruptQueues.some(queue => queue.id === value.queuedCommentInterruptId &&
                     queue.runId === value.runId &&
@@ -391,6 +454,7 @@ export async function buildExecutionContinuation(input: {
     },
     originCommentIds,
     objective: latestRequest?.body ?? issue.description ?? issue.title,
+    objectiveSource,
     messages,
     humanResponses: interactions.flatMap(row => {
       const response = projectHumanInteractionResponse(row);
@@ -403,7 +467,7 @@ export async function buildExecutionContinuation(input: {
         kind: row.kind,
         status: row.status,
         result: row.result,
-      })), ...await childReviewOutcomes(db, companyId, issueId)],
+      })), ...await childReviewOutcomes(db, companyId, issueId, { type: "agent", agentId: input.agentId, companyId, onBehalfOfUserId: issue.responsibleUserId })],
     // Low-trust evidence only: renderPaperclipWakePrompt removes completedWork
     // from requestContext and encodes it in the fenced, non-authoritative
     // continuation-evidence section. It cannot supply objective or authority.
