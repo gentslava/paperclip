@@ -5470,6 +5470,8 @@ export function agentRoutes(
       requestedRuntimeConfig = replaceRuntimeConfig && req.actor.source !== "mcp_oauth"
         ? runtimeConfig
         : { ...existingRuntimeConfig, ...runtimeConfig };
+      // The harness-aware binding restoration below owns omitted AI connections.
+      if (!hasOwn(runtimeConfig, "aiConnection")) delete requestedRuntimeConfig.aiConnection;
       assertProviderTraceSettingTransition(
         req,
         requestedRuntimeConfig,
