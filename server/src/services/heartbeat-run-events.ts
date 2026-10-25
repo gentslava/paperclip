@@ -1,4 +1,4 @@
-import { and, asc, eq, or, sql } from "drizzle-orm";
+import { and, asc, eq, getTableColumns, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRunEvents, heartbeatRuns } from "@paperclipai/db";
 import { nativeSha256 } from "./native-runtime/canonical.js";
@@ -13,6 +13,12 @@ export interface AppendHeartbeatRunEventInput {
   color?: string | null;
   message?: string | null;
   payload?: Record<string, unknown> | null;
+  /** Reuse an existing exhaustion receipt, including receipts from older builds. */
+  retryExhaustion?: {
+    retryReason: string;
+    scheduledRetryAttempt: number;
+    maxAttempts: number;
+  };
   nativeSource?: {
     sourceInstanceId: string;
     sourceEventId: string;
@@ -62,9 +68,33 @@ export async function appendHeartbeatRunEvent(
   db: Db,
   input: AppendHeartbeatRunEventInput,
 ): Promise<AppendHeartbeatRunEventResult> {
+  if (!input.nativeSource && !input.retryExhaustion) {
+    const allocated = db.$with("allocated_run_event", {}).as(sql`
+      update ${heartbeatRuns}
+      set next_event_seq = ${heartbeatRuns.nextEventSeq} + 1,
+          updated_at = ${sql.param(new Date(), heartbeatRuns.updatedAt)}
+      where ${heartbeatRuns.id} = ${input.runId}
+        and ${heartbeatRuns.companyId} = ${input.companyId}
+        and ${heartbeatRuns.agentId} = ${input.agentId}
+      returning company_id, id as run_id, agent_id, next_event_seq - 1 as seq
+    `);
+    const appended = db.$with("appended_run_event", getTableColumns(heartbeatRunEvents)).as(sql`
+      insert into ${heartbeatRunEvents}
+        (company_id, run_id, agent_id, seq, event_type, stream, level, color, message, payload)
+      select company_id, run_id, agent_id, seq,
+        ${input.eventType}, ${input.stream ?? null}, ${input.level ?? null},
+        ${input.color ?? null}, ${input.message ?? null},
+        ${sql.param(input.payload ?? null, heartbeatRunEvents.payload)}
+      from ${allocated}
+      returning *
+    `);
+    const [row] = await db.with(allocated, appended).select().from(appended);
+    if (!row) throw new Error("heartbeat_run_event_binding_mismatch");
+    return { row, disposition: "committed", highestContiguousSourceSeq: 0 };
+  }
   return db.transaction(async (tx) => {
     const run = await tx
-      .select()
+      .select({ companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, input.runId))
       .for("update")
@@ -72,6 +102,32 @@ export async function appendHeartbeatRunEvent(
       .then((rows) => rows[0] ?? null);
     if (!run || run.companyId !== input.companyId || run.agentId !== input.agentId) {
       throw new Error("heartbeat_run_event_binding_mismatch");
+    }
+
+    if (input.retryExhaustion && !input.nativeSource) {
+      // The run lock also serializes concurrent recovery checks across server
+      // instances. Reusing the receipt must not allocate a sequence or publish
+      // another live event on each scheduler tick.
+      const existing = await tx
+        .select()
+        .from(heartbeatRunEvents)
+        .where(and(
+          eq(heartbeatRunEvents.companyId, input.companyId),
+          eq(heartbeatRunEvents.runId, input.runId),
+          eq(heartbeatRunEvents.agentId, input.agentId),
+          eq(heartbeatRunEvents.eventType, "lifecycle"),
+          sql`${heartbeatRunEvents.message} like 'Bounded retry exhausted%'`,
+          sql`${heartbeatRunEvents.payload} @> ${JSON.stringify(input.retryExhaustion)}::jsonb`,
+        ))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (existing) {
+        return {
+          row: existing,
+          disposition: "duplicate" as const,
+          highestContiguousSourceSeq: 0,
+        };
+      }
     }
 
     const sourceHash = input.nativeSource

@@ -11,6 +11,7 @@ import type {
   PaperclipQuestionSet,
 } from "@paperclipai/adapter-utils";
 import type { MentionOption } from "@/components/MarkdownEditor";
+import { MarkdownBody } from "@/components/MarkdownBody";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -24,11 +25,20 @@ import {
   useTaskChatComposerTakeoverActions,
 } from "./TaskChatComposerTakeoverContext";
 import { TaskChatRichInput } from "./TaskChatRichInput";
-import { parseCssTimeMs } from "./motion-tokens";
 import { matchSafeQuestionValidationPattern } from "./question-validation-pattern";
 
 type Question = PaperclipQuestionSet["questions"][number];
 type Answer = PaperclipQuestionResponse["answers"][string];
+
+/**
+ * A form-level message, tagged with whether answering a question resolves it.
+ *
+ * Only a missing-answer complaint is something a selection can settle. A send
+ * that failed is not: the answers are still unsent, so the message has to
+ * outlive the next click rather than disappear the moment the reader touches
+ * an option.
+ */
+type FormError = { message: string; fromMissingAnswer?: boolean };
 
 export interface QuestionFormProps {
   id: string;
@@ -109,7 +119,6 @@ function SelectOption({
   recommended,
   selected,
   multiple,
-  confirming = false,
   disabled,
   onClick,
 }: {
@@ -119,7 +128,6 @@ function SelectOption({
   recommended?: boolean;
   selected: boolean;
   multiple: boolean;
-  confirming?: boolean;
   disabled: boolean;
   onClick: () => void;
 }) {
@@ -147,7 +155,6 @@ function SelectOption({
         className={cn(
           "mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center border",
           multiple ? "rounded-sm" : "rounded-full",
-          confirming && "tc-question-choice-confirm",
           selected
             ? "border-primary bg-primary text-primary-foreground"
             : "border-muted-foreground/50",
@@ -223,7 +230,13 @@ export function QuestionResponseSummary({
   );
 }
 
-export function QuestionForm({
+export function QuestionForm(props: QuestionFormProps) {
+  // Takeovers can reuse this component for another pending request. Remount
+  // before draft persistence runs so one request cannot overwrite another.
+  return <QuestionFormForRequest key={JSON.stringify([props.id, props.draftKey])} {...props} />;
+}
+
+function QuestionFormForRequest({
   id,
   questionSet,
   initialResponse,
@@ -236,6 +249,14 @@ export function QuestionForm({
   onCancel,
 }: QuestionFormProps) {
   const takeoverActions = useTaskChatComposerTakeoverActions();
+  // A provider default is an editable draft only. An existing response or
+  // saved draft, including an explicitly cleared value, always wins. State
+  // initialization runs once so request refreshes cannot replace user edits.
+  const startingAnswers = initialResponse?.answers ?? Object.fromEntries(
+    questionSet.questions
+      .filter((question) => question.answerMode === "text" && question.initialText !== undefined)
+      .map((question) => [question.id, { text: question.initialText! }]),
+  );
   const initialDraft = draftKey
     ? loadStructuredDraft<{
         page: number;
@@ -243,7 +264,7 @@ export function QuestionForm({
         customActive: Record<string, boolean>;
       }>(draftKey, {
         page: 0,
-        answers: structuredClone(initialResponse?.answers ?? {}),
+        answers: structuredClone(startingAnswers),
         customActive: Object.fromEntries(
           Object.entries(initialResponse?.answers ?? {})
             .filter(([, answer]) => Boolean(answer.customText))
@@ -254,7 +275,7 @@ export function QuestionForm({
   const [page, setPage] = useState(initialDraft?.page ?? 0);
   const [answers, setAnswers] = useState<Record<string, Answer>>(
     () =>
-      initialDraft?.answers ?? structuredClone(initialResponse?.answers ?? {}),
+      initialDraft?.answers ?? structuredClone(startingAnswers),
   );
   const [customActive, setCustomActive] = useState<Record<string, boolean>>(
     () =>
@@ -267,12 +288,7 @@ export function QuestionForm({
   );
   const [working, setWorking] = useState<"submit" | "cancel" | null>(null);
   const [inputUploading, setInputUploading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [pendingAdvance, setPendingAdvance] = useState<{
-    page: number;
-    questionId: string;
-    optionId: string;
-  } | null>(null);
+  const [error, setError] = useState<FormError | null>(null);
   const promptRef = useRef<HTMLParagraphElement>(null);
   const previousPage = useRef(page);
 
@@ -296,38 +312,6 @@ export function QuestionForm({
   }, [answers, customActive, draftKey, page]);
 
   const question = questionSet.questions[page];
-  useEffect(() => {
-    if (!pendingAdvance) return;
-    if (
-      disabled ||
-      working ||
-      inputUploading ||
-      pendingAdvance.page !== page ||
-      pendingAdvance.questionId !== question?.id ||
-      page >= questionSet.questions.length - 1
-    ) {
-      setPendingAdvance(null);
-      return;
-    }
-    const duration = getComputedStyle(document.documentElement)
-      .getPropertyValue("--motion-question-confirm")
-      .trim();
-    const durationMs = parseCssTimeMs(duration) || 0;
-    const advance = () => {
-      setPendingAdvance(null);
-      setPage(page + 1);
-    };
-    // With reduced motion (or without CSS), no visual hold is needed.
-    if (durationMs <= 0) {
-      advance();
-      return;
-    }
-    const timer = window.setTimeout(advance, durationMs);
-    return () => window.clearTimeout(timer);
-  }, [
-    pendingAdvance, page, question?.id, questionSet.questions.length,
-    disabled, working, inputUploading,
-  ]);
   const validationErrors = useMemo(
     () =>
       Object.fromEntries(
@@ -381,17 +365,18 @@ export function QuestionForm({
     setAnswers({ ...answers, [question.id]: nextAnswer });
     if (!multiple) {
       setCustomActive((current) => ({ ...current, [question.id]: false }));
-      // Briefly confirm the selected choice before moving on. The last page needs an
-      // explicit submit, and custom answers stay open for typing.
-      if (page < questionSet.questions.length - 1) {
-        setError(null);
-        setPendingAdvance({ page, questionId: question.id, optionId });
-      }
+      // Picking an option answers the question; it does not navigate. Moving on
+      // stays an explicit act — Next, the pagination arrows, or Submit — so a
+      // misclick never costs the reader the page they were still reading.
+      //
+      // Clear only the complaint this selection actually answers. A failed send
+      // has to survive it, or the last page quietly loses the one sign that the
+      // answers never left.
+      setError((current) => (current?.fromMissingAnswer ? null : current));
     }
   }
 
   function toggleCustom() {
-    setPendingAdvance(null);
     const active = !isCustomActive;
     setCustomActive((current) => ({ ...current, [question.id]: active }));
     updateAnswer({
@@ -414,9 +399,10 @@ export function QuestionForm({
       // validating, and a restored draft can land past it. Go back to that
       // question and say so rather than dropping the send.
       setPage(invalidIndex);
-      setError(
-        `Question ${invalidIndex + 1} needs an answer before you can send.`,
-      );
+      setError({
+        message: `Question ${invalidIndex + 1} needs an answer before you can send.`,
+        fromMissingAnswer: true,
+      });
       return;
     }
     setWorking("submit");
@@ -428,11 +414,12 @@ export function QuestionForm({
       });
       if (draftKey) clearDraft(draftKey);
     } catch (cause) {
-      setError(
-        cause instanceof Error
-          ? cause.message
-          : "The answers could not be submitted.",
-      );
+      setError({
+        message:
+          cause instanceof Error
+            ? cause.message
+            : "The answers could not be submitted.",
+      });
     } finally {
       setWorking(null);
     }
@@ -446,11 +433,12 @@ export function QuestionForm({
       await onCancel();
       if (draftKey) clearDraft(draftKey);
     } catch (cause) {
-      setError(
-        cause instanceof Error
-          ? cause.message
-          : "The questions could not be cancelled.",
-      );
+      setError({
+        message:
+          cause instanceof Error
+            ? cause.message
+            : "The questions could not be cancelled.",
+      });
     } finally {
       setWorking(null);
     }
@@ -542,9 +530,14 @@ export function QuestionForm({
       }}
     >
       {questionSet.description ? (
-        <p className="mb-3 text-sm text-muted-foreground">
-          {questionSet.description}
-        </p>
+        <div
+          role="region"
+          aria-label="Question context"
+          tabIndex={0}
+          className="mb-3 max-h-96 overflow-auto text-sm text-muted-foreground"
+        >
+          <MarkdownBody mediaMode="reference" linkIssueReferences={false}>{questionSet.description}</MarkdownBody>
+        </div>
       ) : null}
       {question.answerMode === "text" ? (
         <div className="mb-2 flex items-center gap-3 text-xs text-muted-foreground">
@@ -635,7 +628,6 @@ export function QuestionForm({
               description={option.description}
               recommended={option.recommended}
               selected={selected.includes(option.id)}
-              confirming={pendingAdvance?.questionId === question.id && pendingAdvance.optionId === option.id}
               multiple={multiple}
               disabled={disabled || working != null}
               onClick={() => toggleOption(option.id)}
@@ -684,7 +676,7 @@ export function QuestionForm({
       <div aria-live="assertive">
         {error ? (
           <div className="mt-2 rounded-sm border border-destructive/60 bg-destructive/10 px-2.5 py-2 text-sm text-destructive">
-            {error}
+            {error.message}
           </div>
         ) : null}
       </div>

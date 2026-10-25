@@ -28,7 +28,11 @@ import {
 } from "../../attachment-types.js";
 import { getStorageService } from "../../storage/index.js";
 import type { StorageService } from "../../storage/types.js";
+import { loadConfig } from "../../config.js";
+import { HttpError } from "../../errors.js";
+import { voiceSessionStore, type VoiceTransaction } from "../voice/voice-session-store.js";
 import { issueService } from "../issues.js";
+import { boundExternalChatProvider } from "./external-chat-provider.js";
 import { resolveExternalChatQuestionResponse } from "./external-chat-question-response.js";
 
 export const LIST_CHAT_ATTACHMENTS_TOOL_NAME = "list_chat_attachments";
@@ -180,6 +184,8 @@ export type PreparedReusedChatAttachment = {
       attachmentId: string;
       workProductId: string;
       commentId: string;
+      filename: string;
+      byteSize: number;
       sha256: string;
     };
   };
@@ -337,7 +343,7 @@ async function principalAuthorized(
     }
   }
   const principalQuery = tx
-    .select({ id: chatExternalPrincipals.id })
+    .select({ id: chatExternalPrincipals.id, externalId: chatExternalPrincipals.externalId })
     .from(chatExternalPrincipals)
     .where(
       and(
@@ -356,6 +362,16 @@ async function principalAuthorized(
       ? principalQuery.for("update", { noWait: true }).limit(1)
       : principalQuery.for("update").limit(1));
   if (!principal) return false;
+  if (endpoint.provider === "speko") {
+    try {
+      await voiceSessionStore(tx, { allowLocalBoard: loadConfig().deploymentMode === "local_trusted", nonblockingAuthority: lockMode === "nonblocking" })
+        .authorizePrincipal(tx as unknown as VoiceTransaction, endpoint.companyId, endpoint.id, principal.externalId);
+      return true;
+    } catch (error) {
+      if (error instanceof HttpError && [403, 404].includes(error.status)) return false;
+      throw error;
+    }
+  }
   const linkQuery = tx
     .select({
       status: chatIdentityLinks.status,
@@ -416,16 +432,7 @@ export async function authorizeChatConversationForBoundRun(
     context = answer.authorizationContext;
   }
   const source = typeof context.source === "string" ? context.source : "";
-  const provider = [
-    "slack",
-    "github",
-    "discord",
-    "microsoft-teams",
-    "telegram",
-  ].find(
-    (candidate) =>
-      source === `chat:${candidate}` || source === `chat:${candidate}:recovery`,
-  );
+  const provider = boundExternalChatProvider(source);
   const commentIds = wakeCommentIds(context);
   if (
     !provider ||
@@ -546,16 +553,7 @@ function externalChatWaitCandidate(
 ): { provider: string; commentIds: string[] } | null {
   const context = record(contextSnapshot);
   const source = typeof context.source === "string" ? context.source : "";
-  const provider = [
-    "slack",
-    "github",
-    "discord",
-    "microsoft-teams",
-    "telegram",
-  ].find(
-    (candidate) =>
-      source === `chat:${candidate}` || source === `chat:${candidate}:recovery`,
-  );
+  const provider = boundExternalChatProvider(source);
   const commentIds = wakeCommentIds(context);
   const wake = record(context.paperclipWake);
   const wakeIssue = record(wake.issue);
@@ -1528,6 +1526,8 @@ export async function prepareReusedChatAttachment(input: {
           attachmentId: attachment.id,
           workProductId: attachment.artifactWorkProductId,
           commentId: comment.id,
+          filename: input.source.filename,
+          byteSize: body.length,
           sha256: attachment.sha256,
         },
       },

@@ -137,7 +137,7 @@ export function BreadcrumbBar({ taskDetailLayout = false }: { taskDetailLayout?:
                 <BreadcrumbItem className={isLast ? "min-w-0" : "shrink-0"}>
                   {isLast || !crumb.href ? (
                     crumb.leading || crumb.identifier ? (
-                      <BreadcrumbPage className="flex min-w-0 items-baseline gap-1.5">
+                      <BreadcrumbPage className={cn("flex min-w-0 gap-1.5", crumb.trailing ? "items-center" : "items-baseline")}>
                         {crumb.leading && (
                           <span className="flex shrink-0 items-center self-center">{crumb.leading}</span>
                         )}
@@ -152,7 +152,7 @@ export function BreadcrumbBar({ taskDetailLayout = false }: { taskDetailLayout?:
                     <BreadcrumbLink asChild>
                       {crumb.leading || crumb.identifier ? (
                         <Link
-                          to={crumb.href}
+                          to={crumb.href} onClick={crumb.onClick}
                           className={cn(
                             "flex min-w-0 items-baseline gap-1.5",
                             i === 0 && "font-semibold uppercase tracking-wider text-muted-foreground hover:text-foreground",
@@ -167,7 +167,7 @@ export function BreadcrumbBar({ taskDetailLayout = false }: { taskDetailLayout?:
                         </Link>
                       ) : (
                         <Link
-                          to={crumb.href}
+                          to={crumb.href} onClick={crumb.onClick}
                           className={cn(
                             "min-w-0 truncate",
                             i === 0 && "font-semibold uppercase tracking-wider text-muted-foreground hover:text-foreground",
@@ -178,6 +178,7 @@ export function BreadcrumbBar({ taskDetailLayout = false }: { taskDetailLayout?:
                       )}
                     </BreadcrumbLink>
                   )}
+                  {crumb.trailing && <span className="flex shrink-0 items-center">{crumb.trailing}</span>}
                 </BreadcrumbItem>
               </Fragment>
             );
@@ -187,8 +188,9 @@ export function BreadcrumbBar({ taskDetailLayout = false }: { taskDetailLayout?:
     </div>
   );
 
-  // Single breadcrumb = page title (uppercase)
-  if (breadcrumbs.length === 1) {
+  // Task details use the same breadcrumb typography even with one item.
+  // Other single-crumb pages keep their existing page-title presentation.
+  if (breadcrumbs.length === 1 && !taskDetailLayout) {
     return (
       <div className="h-(--sz-60px) shrink-0 flex items-center border-b border-border px-4 md:px-6">
         {menuButton}

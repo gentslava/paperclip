@@ -1,5 +1,6 @@
 import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import {
+  agentWakeupRequests,
   heartbeatRuns,
   heartbeatRunEvents,
   issueComments,
@@ -9,12 +10,61 @@ import {
   type Db,
 } from "@paperclipai/db";
 import { conflict, forbidden } from "../errors.js";
+import { boundRunIssueId, runTaskContextColumn } from "./run-task-binding.js";
 import { isUuidLike } from "@paperclipai/shared";
+import { queuedCommentIdsFromRunContext, queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
+
+/** Resolve an explicit click from persisted receipts, never caller context or message authors. */
+export async function explicitOperatorRunIdentity(
+  executor: Pick<Db, "select">,
+  run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId" | "contextSnapshot" | "wakeupRequestId">,
+) {
+  const [request] = run.wakeupRequestId ? await executor.select().from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.id, run.wakeupRequestId), eq(agentWakeupRequests.companyId, run.companyId),
+    eq(agentWakeupRequests.agentId, run.agentId), eq(agentWakeupRequests.runId, run.id),
+  )) : [];
+  if (request?.payload?.manualUserWake === true) {
+    if (request.requestedByActorType !== "user" || !request.requestedByActorId) {
+      throw forbidden("Manual wake requires an authenticated user");
+    }
+    return { actorId: request.requestedByActorId, cause: "manual_user_wake" };
+  }
+  const prefix = "queued-comment-interrupt:";
+  if (!request?.idempotencyKey?.startsWith(prefix)) return null;
+  const queueId = request.idempotencyKey.slice(prefix.length);
+  // The key only locates a candidate. The consumed queue, actor, run, company,
+  // agent, task, and delivered messages must all independently agree.
+  if (!isUuidLike(queueId)) {
+    throw forbidden("Queued-message interrupt authority is unavailable");
+  }
+  const [receipt] = await executor.select().from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.id, queueId), eq(agentWakeupRequests.companyId, run.companyId),
+    eq(agentWakeupRequests.agentId, run.agentId), eq(agentWakeupRequests.runId, run.id),
+    eq(agentWakeupRequests.status, "coalesced"),
+  ));
+  const marker = receipt?.payload?.queuedCommentInterrupt;
+  const actorId = marker && typeof marker === "object" && "actorId" in marker ? marker.actorId : null;
+  const ids = queuedCommentIdsFromWakePayload(receipt?.payload);
+  const deliveredIds = queuedCommentIdsFromRunContext(run.contextSnapshot);
+  if (typeof actorId !== "string" || !actorId || !ids.length ||
+      receipt?.payload?.issueId !== run.contextSnapshot?.issueId ||
+      !ids.every(id => deliveredIds.includes(id)) ||
+      request.requestedByActorType !== "user" || request.requestedByActorId !== actorId) {
+    throw forbidden("Queued-message interrupt authority is unavailable");
+  }
+  return { actorId, cause: "queued_comment_interrupt" };
+}
 
 export type RunIdentityContext = typeof runIdentityContexts.$inferSelect;
 type Executor = Pick<Db, "select" | "insert" | "update">;
 
-/** Match task mutation ordering: lock the task before the run, never the reverse. */
+/**
+ * Lock the task before the run, matching task mutation ordering. Identity
+ * operations do not change parent keys: NO KEY UPDATE still serializes writers
+ * and steering, while allowing audit inserts to check their foreign keys.
+ * FOR UPDATE can deadlock with an append that holds KEY SHARE on the run and
+ * then checks the task while identity capture holds the task and waits on the run.
+ */
 async function lockIdentityTask(
   executor: Pick<Db, "select">,
   companyId: string,
@@ -22,19 +72,18 @@ async function lockIdentityTask(
 ) {
   const [run] = await executor
     .select({
-      context: heartbeatRuns.contextSnapshot,
-      issueId: heartbeatRuns.nativeIssueId,
+      contextSnapshot: runTaskContextColumn,
+      nativeIssueId: heartbeatRuns.nativeIssueId,
+      issueId: heartbeatRuns.issueId,
     })
     .from(heartbeatRuns)
     .where(
       and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, companyId)),
     );
-  const issueId = run?.context?.issueId ?? run?.context?.taskId ?? run?.issueId;
-  if (
-    issueId !== undefined &&
-    issueId !== null &&
-    (typeof issueId !== "string" || !isUuidLike(issueId))
-  ) {
+  const issueId = run?.nativeIssueId ?? run?.issueId ?? run?.contextSnapshot?.issueId ?? run?.contextSnapshot?.taskId;
+  const legacyIssueId = run?.contextSnapshot?.issueId ?? run?.contextSnapshot?.taskId;
+  if ([issueId, legacyIssueId].some(id => id !== undefined && id !== null &&
+      (typeof id !== "string" || !isUuidLike(id)))) {
     throw forbidden("Run task identity is invalid");
   }
   if (typeof issueId === "string")
@@ -42,7 +91,7 @@ async function lockIdentityTask(
       .select({ id: issues.id })
       .from(issues)
       .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
-      .for("update");
+      .for("no key update");
 }
 
 async function append(
@@ -101,8 +150,12 @@ async function activate(executor: Executor, context: RunIdentityContext) {
         eq(heartbeatRuns.companyId, context.companyId),
       ),
     )
-    .returning();
-  const issueId = run?.contextSnapshot?.issueId ?? run?.contextSnapshot?.taskId;
+    .returning({
+      nativeIssueId: heartbeatRuns.nativeIssueId,
+      issueId: heartbeatRuns.issueId,
+      contextSnapshot: runTaskContextColumn,
+    });
+  const issueId = run ? boundRunIssueId(run) : null;
   if (typeof issueId === "string")
     await executor
       .update(issues)
@@ -138,7 +191,7 @@ export async function initializeRunIdentity(
           eq(heartbeatRuns.companyId, input.companyId),
         ),
       )
-      .for("update");
+      .for("no key update");
     if (!run) throw forbidden("Run identity does not belong to this company");
     if (run.activeIdentityContextId) {
       const [current] = await tx
@@ -147,6 +200,7 @@ export async function initializeRunIdentity(
         .where(eq(runIdentityContexts.id, run.activeIdentityContextId));
       return current!;
     }
+    const operatorIdentity = await explicitOperatorRunIdentity(tx, run);
     const [parent] = input.parentRunId
       ? await tx
           .select()
@@ -171,10 +225,9 @@ export async function initializeRunIdentity(
               ),
             )
         : [];
-    const parentId =
-      interaction?.sourceIdentityContextId ??
-      input.parentContextId ??
-      parent?.activeIdentityContextId;
+    const parentId = operatorIdentity ? null : (
+      interaction?.sourceIdentityContextId ?? input.parentContextId ?? parent?.activeIdentityContextId
+    );
     const [origin] = parentId
       ? await tx
           .select()
@@ -192,12 +245,10 @@ export async function initializeRunIdentity(
     let current = await append(tx, {
       companyId: input.companyId,
       runId: input.runId,
-      responsibleUserId: origin
-        ? origin.responsibleUserId
-        : input.responsibleUserId,
+      responsibleUserId: operatorIdentity?.actorId ?? (origin ? origin.responsibleUserId : input.responsibleUserId),
       parentContextId: origin?.id ?? null,
       cause:
-        origin?.cause === "company_default" ? "company_default" : input.cause,
+        operatorIdentity ? operatorIdentity.cause : origin?.cause === "company_default" ? "company_default" : input.cause,
       correlationId: "dispatch",
     });
     const ids = [...new Set(input.messageIds ?? [])];
@@ -220,10 +271,10 @@ export async function initializeRunIdentity(
       current = await append(tx, {
         companyId: input.companyId,
         runId: input.runId,
-        responsibleUserId: comment.authorUserId,
+        responsibleUserId: operatorIdentity?.actorId ?? comment.authorUserId,
         messageId: id,
         parentContextId: current.id,
-        cause: "instruction",
+        cause: operatorIdentity?.cause ?? "instruction",
         correlationId: `message:${id}`,
       });
     }
@@ -239,6 +290,7 @@ export async function prepareSteeredIdentity(
     runId: string;
     messageId: string;
     issueId: string;
+    source?: "comment" | "interaction";
   },
 ) {
   const [run] = await executor
@@ -250,7 +302,7 @@ export async function prepareSteeredIdentity(
         eq(heartbeatRuns.companyId, input.companyId),
       ),
     );
-  const [comment] = await executor
+  const [comment] = input.source === "interaction" ? [] : await executor
     .select()
     .from(issueComments)
     .where(
@@ -260,23 +312,29 @@ export async function prepareSteeredIdentity(
         eq(issueComments.issueId, input.issueId),
       ),
     );
-  if (!run || !comment?.authorUserId)
+  const [interaction] = input.source === "interaction" ? await executor.select().from(issueThreadInteractions).where(and(
+    eq(issueThreadInteractions.id, input.messageId),
+    eq(issueThreadInteractions.companyId, input.companyId),
+    eq(issueThreadInteractions.issueId, input.issueId),
+    inArray(issueThreadInteractions.status, ["accepted", "answered", "rejected"]),
+  )) : [];
+  const responsibleUserId = interaction?.resolvedByUserId ?? comment?.authorUserId;
+  if (!run || !responsibleUserId)
     throw forbidden("Steering requires an authenticated message author");
   if (
     run.status !== "running" ||
-    (run.contextSnapshot?.issueId !== input.issueId &&
-      run.contextSnapshot?.taskId !== input.issueId)
+    boundRunIssueId(run) !== input.issueId
   ) {
     throw conflict("Steering targets a different or inactive execution");
   }
   return append(executor, {
     companyId: input.companyId,
     runId: input.runId,
-    responsibleUserId: comment.authorUserId,
-    messageId: comment.id,
+    responsibleUserId,
+    messageId: input.messageId,
     parentContextId: run.activeIdentityContextId,
     cause: "steering",
-    correlationId: `message:${comment.id}`,
+    correlationId: `${input.source === "interaction" ? "interaction" : "message"}:${input.messageId}`,
     status: "pending",
   });
 }
@@ -296,7 +354,7 @@ export async function reserveSteeredIdentity(
           eq(heartbeatRuns.companyId, input.companyId),
         ),
       )
-      .for("update");
+      .for("no key update");
     // Processes started before the broker rollout keep their original environment.
     if (!run?.activeIdentityContextId) return null;
     const [pending] = await tx
@@ -390,7 +448,7 @@ export async function captureRunIdentity(
           eq(heartbeatRuns.agentId, input.agentId),
         ),
       )
-      .for("update");
+      .for("no key update");
     if (!run || run.status !== "running")
       throw forbidden(
         "Credential acquisition requires this agent's active run",
@@ -463,7 +521,7 @@ export async function reconcileSteeredIdentity(
           eq(heartbeatRuns.companyId, context.companyId),
         ),
       )
-      .for("update");
+      .for("no key update");
     if (!run) return;
     await acceptSteeredIdentity(tx, context);
   });
@@ -472,7 +530,7 @@ export async function reconcileSteeredIdentity(
 /** Only events validated and persisted by the native control-plane transport count. */
 export async function storedSteeringAcknowledgement(
   executor: Pick<Db, "select">,
-  context: RunIdentityContext,
+  context: Pick<RunIdentityContext, "companyId" | "runId" | "messageId">,
 ) {
   if (!context.messageId) return null;
   const [receipt] = await executor

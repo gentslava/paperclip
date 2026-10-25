@@ -1,18 +1,26 @@
+import { slackTestMessageSchema, slackRegistrationSchema, slackSetupActionSchema, slackManagedProvisionSchema } from "@paperclipai/shared";
+import { isCrossSiteOAuthCallbackNavigation, oauthCallbackInterstitialHtml } from "../lib/oauth-browser-return.js";
 import {
   Router,
   type Request as ExpressRequest,
   type Response as ExpressResponse,
 } from "express";
+import { z } from "zod";
+import { githubChatManagementService } from "../services/chat-github-management.js";
+import { updateGitHubChatConfigurationSchema } from "@paperclipai/shared";
 import type { Db } from "@paperclipai/db";
 import {
   CHAT_PROVIDERS,
   configureChatEndpointSchema,
+  inspectPhotonProjectSchema,
   confirmChatIdentityLinkSchema,
   createChatEndpointSchema,
   createChatIdentityLinkIntentSchema,
   isUuidLike,
   publishChatPublicationSchema,
   replaceChatEndpointResourcesSchema,
+  gitHubRepositoryPageQuerySchema,
+  toggleAllGitHubRepositoriesSchema,
   resolveChatActionSchema,
   resolveChatPublicationSchema,
   updateChatEndpointSchema,
@@ -25,6 +33,7 @@ import {
   type ChatChannelServiceOptions,
 } from "../services/chat-channels.js";
 import { accessService } from "../services/access.js";
+import { instanceSettingsService } from "../services/instance-settings.js";
 import { recordChatWebhookStage } from "../services/chat-webhook-diagnostics.js";
 import {
   createInviteRateLimiter,
@@ -85,6 +94,30 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
   const router = Router();
   const service = options.service ?? chatChannelService(db, options);
   const access = accessService(db);
+  const github = githubChatManagementService(db, options.fetch);
+
+  async function assertIdentityLinkAccess(req: ExpressRequest) {
+    assertBoard(req);
+    const userId = actorUserId(req);
+    if (!userId) throw badRequest("A signed-in Paperclip user is required");
+    // Enforce rollout here: invited nonmembers cannot read the board's
+    // experimental-settings API. A private token never bypasses this gate.
+    const experimental = await instanceSettingsService(db).getExperimental();
+    if (!experimental.enableChatConnectors && !experimental.enableGitHubReviewBots) {
+      throw forbidden("Chat connectors are not enabled on this instance");
+    }
+    return { userId, experimental };
+  }
+
+  function assertIdentityProviderEnabled(
+    provider: string,
+    experimental: { enableChatConnectors: boolean; enableGitHubReviewBots: boolean },
+  ) {
+    const enabled = provider === "agentmail" || (provider === "github"
+      ? experimental.enableGitHubReviewBots
+      : experimental.enableChatConnectors);
+    if (!enabled) throw forbidden("This connector is not enabled on this instance");
+  }
 
   async function assertConnectionManager(
     req: ExpressRequest,
@@ -131,6 +164,10 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
     async (req, res) => {
       const companyId = req.params.companyId as string;
       await assertConnectionManager(req, companyId);
+      if (req.body.provider === "slack" && !req.body.slackSetupMethod) {
+        req.body.slackSetupMethod = service.slackRegistration.managerGrants.defaultMethod();
+      }
+      if (req.body.slackSetupMethod === "managed" && service.slackRegistration.managerGrants.defaultMethod() !== "managed") throw forbidden("Managed Slack setup is unavailable");
       res
         .status(201)
         .json(await service.create(companyId, req.body, actorUserId(req)));
@@ -140,6 +177,187 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
   router.get("/chat-endpoints/:endpointId", async (req, res) => {
     if (!(await assertEndpointAccess(req, res, service))) return;
     res.json(await service.get(endpointId(req)));
+  });
+
+  const slackActor = (req: ExpressRequest) => {
+    assertBoard(req);
+    const actor = getActorInfo(req);
+    if (actor.actorType !== "user") throw forbidden("A board session is required");
+    return { userId: actor.actorId, sessionId: actor.sessionId,
+      bypassPermissionCheck: req.actor.source === "local_implicit" || req.actor.isInstanceAdmin === true };
+  };
+  router.get("/companies/:companyId/chat-slack/setup-options", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    await assertConnectionManager(req, companyId);
+    res.set("Cache-Control", "no-store");
+    res.json(await service.slackRegistration.managerGrants.choices(companyId, slackActor(req)));
+  });
+  router.post("/chat-endpoints/:endpointId/slack/managed/authorize", validate(slackSetupActionSchema), async (req, res) => {
+    if (!(await assertEndpointManagementAccess(req, res))) return;
+    res.set("Cache-Control", "no-store");
+    res.json(await service.slackRegistration.managerGrants.authorize(endpointId(req), slackActor(req)));
+  });
+  router.post("/chat-endpoints/:endpointId/slack/managed/provision", validate(slackManagedProvisionSchema), async (req, res) => {
+    if (!(await assertEndpointManagementAccess(req, res))) return;
+    res.set("Cache-Control", "no-store");
+    res.json(await service.slackRegistration.managed.provision(endpointId(req), slackActor(req), req.body));
+  });
+  router.delete("/companies/:companyId/chat-slack/manager-grants/:grantId", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    await assertConnectionManager(req, companyId);
+    await service.slackRegistration.managerGrants.revoke(req.params.grantId as string, companyId, slackActor(req));
+    res.sendStatus(204);
+  });
+  router.get("/chat-slack/managed/oauth/callback", async (req, res) => {
+    res.set("Cache-Control", "no-store"); res.set("Referrer-Policy", "no-referrer");
+    const actor = slackActor(req);
+    const state = typeof req.query.state === "string" ? req.query.state : "";
+    const expiredId = await service.slackRegistration.managerGrants.expiredReturn(state, actor);
+    if (expiredId) { res.redirect(303, await service.slackRegistration.returnPath(expiredId)); return; }
+    const pending = await service.slackRegistration.managerGrants.pending(state, actor);
+    await assertConnectionManager(req, pending.current.endpoint.companyId);
+    if (req.get("accept")?.includes("text/html") && isCrossSiteOAuthCallbackNavigation(req)) {
+      res.type("html").send(oauthCallbackInterstitialHtml()); return;
+    }
+    const id = await service.slackRegistration.managerGrants.complete(state,
+      typeof req.query.claim_id === "string" ? req.query.claim_id : null,
+      typeof req.query.error === "string" ? req.query.error : null, actor,
+      typeof req.query.code === "string" ? req.query.code : null);
+    res.redirect(303, await service.slackRegistration.returnPath(id));
+  });
+  router.post("/chat-endpoints/:endpointId/slack/test-message", validate(slackTestMessageSchema), async (req, res) => {
+    if (!(await assertEndpointManagementAccess(req, res))) return;
+    res.set("Cache-Control", "no-store");
+    res.json(await service.sendSlackTestMessage(endpointId(req), slackActor(req), req.body));
+  });
+  router.post("/chat-endpoints/:endpointId/slack/registration", validate(slackRegistrationSchema), async (req, res) => {
+    if (!(await assertEndpointManagementAccess(req, res))) return;
+    res.set("Cache-Control", "no-store");
+    await service.slackRegistration.create(endpointId(req), slackActor(req), req.body);
+    res.json(await service.get(endpointId(req)));
+  });
+  router.post("/chat-endpoints/:endpointId/slack/install", validate(slackSetupActionSchema), async (req, res) => {
+    if (!(await assertEndpointManagementAccess(req, res))) return;
+    res.set("Cache-Control", "no-store");
+    res.json(await service.slackRegistration.install(endpointId(req), slackActor(req)));
+  });
+  router.post("/chat-endpoints/:endpointId/slack/resume", validate(slackSetupActionSchema), async (req, res) => {
+    if (!(await assertEndpointManagementAccess(req, res))) return;
+    res.set("Cache-Control", "no-store");
+    await service.slackRegistration.resume(endpointId(req), slackActor(req));
+    res.json(await service.get(endpointId(req)));
+  });
+  router.get("/chat-slack/oauth/callback", async (req, res) => {
+    res.set("Cache-Control", "no-store");
+    res.set("Referrer-Policy", "no-referrer");
+    const actor = slackActor(req);
+    const state = typeof req.query.state === "string" ? req.query.state : "";
+    const expiredReturn = await service.slackRegistration.expiredReturn(state, actor);
+    if (expiredReturn) { res.redirect(303, expiredReturn); return; }
+    const pending = await service.slackRegistration.pending(state, actor);
+    await assertConnectionManager(req, pending.row.companyId);
+    if (req.get("accept")?.includes("text/html") && isCrossSiteOAuthCallbackNavigation(req)) {
+      res.type("html").send(oauthCallbackInterstitialHtml());
+      return;
+    }
+    const endpoint = await service.slackRegistration.complete(state,
+      typeof req.query.code === "string" ? req.query.code : null,
+      typeof req.query.error === "string" ? req.query.error : null, actor);
+    res.redirect(303, await service.slackRegistration.returnPath(endpoint));
+  });
+
+  const githubUser = (req: ExpressRequest) => {
+    const userId = actorUserId(req);
+    if (!userId) throw badRequest("Sign in to your Paperclip account to set up this bot");
+    return userId;
+  };
+  router.get("/chat-endpoints/:endpointId/github/configuration", async (req, res) => {
+    if (!(await assertEndpointManagementAccess(req, res))) return;
+    res.json(await github.configuration(endpointId(req), githubUser(req)));
+  });
+  router.put("/chat-endpoints/:endpointId/github/configuration", validate(updateGitHubChatConfigurationSchema), async (req, res) => {
+    if (!(await assertEndpointManagementAccess(req, res))) return;
+    res.json(await github.saveConfiguration(endpointId(req), req.body, githubUser(req)));
+  });
+  router.post("/chat-endpoints/:endpointId/github/verify", async (req, res) => {
+    if (!(await assertEndpointManagementAccess(req, res))) return;
+    res.json(await github.verification(endpointId(req)));
+  });
+  router.put("/chat-endpoints/:endpointId/github/progress", validate(z.object({ stage: z.enum(["setup", "connect", "install", "repositories", "verify", "identity", "behavior", "test"]) }).strict()), async (req, res) => {
+    if (!(await assertEndpointManagementAccess(req, res))) return;
+    res.json(await service.saveGitHubSetupProgress(endpointId(req), req.body.stage));
+  });
+  router.get("/chat-endpoints/:endpointId/github/reviews/:reviewId", async (req, res) => {
+    if (!(await assertEndpointAccess(req, res, service))) return;
+    const reviewId = z.string().uuid().safeParse(req.params.reviewId);
+    if (!reviewId.success) throw badRequest("Invalid review ID");
+    res.json(await github.review(endpointId(req), reviewId.data));
+  });
+  router.get("/chat-endpoints/:endpointId/github/reviews", async (req, res) => {
+    if (!(await assertEndpointAccess(req, res, service))) return;
+    res.json(await github.reviews(endpointId(req)));
+  });
+  router.get("/chat-endpoints/:endpointId/github/personal-connections", async (req, res) => {
+    if (!(await assertEndpointAccess(req, res, service))) return;
+    res.json(await github.personalConnections(endpointId(req), githubUser(req)));
+  });
+  router.post("/chat-endpoints/:endpointId/github/identity", validate(z.object({ connectionId: z.string().uuid(), confirmedGithubUserId: z.string().regex(/^[1-9][0-9]*$/).optional() }).strict()), async (req, res) => {
+    if (!(await assertEndpointAccess(req, res, service))) return;
+    res.json(await github.identity(endpointId(req), req.body.connectionId, githubUser(req), req.body.confirmedGithubUserId));
+  });
+  router.post("/chat-endpoints/:endpointId/github/people/lookup", validate(z.object({ login: z.string().min(1).max(44) }).strict()), async (req, res) => {
+    if (!(await assertEndpointManagementAccess(req, res))) return;
+    res.json(await github.lookupPerson(req.body.login));
+  });
+  router.post("/chat-endpoints/:endpointId/github/registration", validate(z.object({ name: z.string().trim().min(1).max(34), ownerType: z.enum(["personal", "organization"]).optional(), ownerLogin: z.string().regex(/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/).optional() }).strict().refine(value => value.ownerType !== "organization" || !!value.ownerLogin, "Enter the GitHub organization")), async (req, res) => {
+    if (!(await assertEndpointManagementAccess(req, res))) return;
+    res.set("Cache-Control", "no-store");
+    res.json(req.body.ownerType === undefined
+      ? await service.startGitHubRegistration(endpointId(req), githubUser(req), req.body.name)
+      : await service.githubWizard.start(endpointId(req), githubUser(req), req.body));
+  });
+  router.post("/chat-endpoints/:endpointId/github/registration/restart", validate(z.object({ registrationId: z.string().uuid(), appNotCreated: z.literal(true) }).strict()), async (req, res) => {
+    if (!(await assertEndpointManagementAccess(req, res))) return;
+    res.set("Cache-Control", "no-store");
+    res.json(await service.githubWizard.restartRegistration(endpointId(req), githubUser(req), req.body.registrationId));
+  });
+  router.put("/chat-endpoints/:endpointId/github/draft", validate(z.object({ name: z.string().trim().min(1).max(34), ownerType: z.enum(["personal", "organization"]), ownerLogin: z.string().regex(/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/).optional() }).strict()), async (req, res) => {
+    if (!(await assertEndpointManagementAccess(req, res))) return;
+    res.set("Cache-Control", "no-store");
+    res.json(await service.githubWizard.saveDraft(endpointId(req), githubUser(req), req.body));
+  });
+  router.post("/chat-endpoints/:endpointId/github/setup", async (req, res) => {
+    if (!(await assertEndpointManagementAccess(req, res))) return;
+    res.set("Cache-Control", "no-store");
+    res.json(await service.githubWizard.advance(endpointId(req), githubUser(req)));
+  });
+  router.post("/chat-endpoints/:endpointId/github/identity/start", async (req, res) => {
+    if (!(await assertEndpointManagementAccess(req, res))) return;
+    res.set("Cache-Control", "no-store");
+    res.json(await service.githubWizard.startIdentity(endpointId(req), githubUser(req)));
+  });
+  router.post("/chat-endpoints/:endpointId/github/identity/confirm", validate(z.object({ githubUserId: z.string().regex(/^[1-9][0-9]*$/) }).strict()), async (req, res) => {
+    if (!(await assertEndpointManagementAccess(req, res))) return;
+    res.set("Cache-Control", "no-store");
+    res.json(await service.githubWizard.confirmIdentity(endpointId(req), githubUser(req), req.body.githubUserId));
+  });
+  router.post("/chat-endpoints/:endpointId/github/app", validate(z.object({ appId: z.string().regex(/^[1-9][0-9]*$/), privateKey: z.string().min(1).max(32000), webhookSecret: z.string().min(16).max(1024), clientId: z.string().min(1).max(128).optional(), clientSecret: z.string().min(1).max(1024).optional() }).strict().refine(value => !!value.clientId === !!value.clientSecret, "Supply both OAuth client credentials")), async (req, res) => {
+    if (!(await assertEndpointManagementAccess(req, res))) return;
+    res.json(await service.storeGitHubApp(endpointId(req), githubUser(req), req.body));
+  });
+  router.post("/chat-endpoints/:endpointId/github/repositories/refresh", async (req, res) => {
+    if (!(await assertEndpointManagementAccess(req, res))) return;
+    res.json(await service.refreshGitHubRepositories(endpointId(req), githubUser(req)));
+  });
+  router.get("/chat-endpoints/:endpointId/github/repositories", async (req, res) => {
+    if (!(await assertEndpointAccess(req, res, service))) return;
+    const query = gitHubRepositoryPageQuerySchema.safeParse(req.query);
+    if (!query.success) throw badRequest("Invalid repository search or page");
+    res.json(await service.listGitHubRepositories(endpointId(req), query.data));
+  });
+  router.put("/chat-endpoints/:endpointId/github/repositories/access", validate(toggleAllGitHubRepositoriesSchema), async (req, res) => {
+    if (!(await assertEndpointManagementAccess(req, res))) return;
+    res.json(await service.toggleAllGitHubRepositories(endpointId(req), req.body.enabled, actorUserId(req)));
   });
 
   router.patch(
@@ -152,6 +370,12 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
       );
     },
   );
+
+  router.post("/chat-endpoints/:endpointId/photon/inspect", validate(inspectPhotonProjectSchema), async (req, res) => {
+    if (!(await assertEndpointManagementAccess(req, res))) return;
+    res.set("Cache-Control", "no-store");
+    res.json(await service.inspectPhoton(endpointId(req), req.body));
+  });
 
   router.post(
     "/chat-endpoints/:endpointId/setup",
@@ -177,6 +401,20 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
   router.post("/chat-endpoints/:endpointId/test", async (req, res) => {
     if (!(await assertEndpointManagementAccess(req, res))) return;
     res.json(await service.test(endpointId(req)));
+  });
+
+  router.post("/chat-endpoints/:endpointId/finish", async (req, res) => {
+    if (!(await assertEndpointManagementAccess(req, res))) return;
+    const userId = actorUserId(req);
+    if (!userId) throw badRequest("A signed-in Paperclip user is required");
+    res.json(await service.finishSlackSetup(endpointId(req), userId));
+  });
+  router.get("/chat-endpoints/:endpointId/test-status", async (req, res) => {
+    if (!(await assertEndpointAccess(req, res, service))) return;
+    const userId = actorUserId(req);
+    if (!userId) throw badRequest("A signed-in Paperclip user is required");
+    res.set("Cache-Control", "no-store");
+    res.json(await service.setupTestStatus(endpointId(req), userId));
   });
 
   router.get("/chat-endpoints/:endpointId/resources", async (req, res) => {
@@ -237,30 +475,37 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
     "/chat-identity-links/confirm",
     validate(confirmChatIdentityLinkSchema),
     async (req, res) => {
-      assertBoard(req);
-      const userId = actorUserId(req);
-      if (!userId) throw badRequest("A signed-in Paperclip user is required");
+      const { userId, experimental } = await assertIdentityLinkAccess(req);
+      const preview = await service.previewIdentityLink(req.body.token, userId);
+      assertIdentityProviderEnabled(preview.provider, experimental);
       res.json(await service.confirmIdentityLink(req.body.token, userId));
     },
   );
 
+  router.post("/chat-identity-links/request-access", validate(confirmChatIdentityLinkSchema), async (req, res) => {
+    const { userId, experimental } = await assertIdentityLinkAccess(req);
+    const preview = await service.previewIdentityLink(req.body.token, userId);
+    assertIdentityProviderEnabled(preview.provider, experimental);
+    res.json(await service.requestIdentityAccess(req.body.token, userId, req.ip ?? "unknown"));
+  });
+
   router.get("/chat-identity-links/preview", async (req, res) => {
-    assertBoard(req);
+    const { userId, experimental } = await assertIdentityLinkAccess(req);
     const token = typeof req.query.token === "string" ? req.query.token : "";
     if (token.length < 32 || token.length > 4096)
       throw badRequest("A valid identity-link token is required");
-    const preview = await getAccessibleResource(
-      req,
-      res,
-      service.previewIdentityLink(token).catch((error) => {
-        // Do not distinguish a valid foreign-company token from an invalid or
-        // expired token. Confirmation keeps its own validation contract.
-        if (error instanceof HttpError && error.status === 422) return null;
-        throw error;
-      }),
-      "Identity-link request not found",
+    res.set("Cache-Control", "no-store");
+    const invitation = await service.previewIdentityLink(token, userId).catch((error) => {
+      if (error instanceof HttpError && error.status === 422) return null;
+      throw error;
+    });
+    // A link privately issued to a signed Slack sender is an invitation to
+    // request membership. Other link intents retain company-access checks.
+    const preview = invitation?.selfService ? invitation : await getAccessibleResource(
+      req, res, Promise.resolve(invitation), "Identity-link request not found",
     );
     if (!preview) return;
+    assertIdentityProviderEnabled(preview.provider, experimental);
     res.json(preview);
   });
 
@@ -271,7 +516,13 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
 
   router.get("/chat-endpoints/:endpointId/activity", async (req, res) => {
     if (!(await assertEndpointAccess(req, res, service))) return;
-    res.json(await service.listActivity(endpointId(req)));
+    if (req.query.limit !== undefined || req.query.cursor !== undefined) {
+      if ((req.query.limit !== undefined && (typeof req.query.limit !== "string" || !/^\d+$/.test(req.query.limit)))
+        || (req.query.cursor !== undefined && typeof req.query.cursor !== "string")) throw badRequest("Invalid activity pagination parameters");
+      res.json(await service.listActivityPage(endpointId(req), req.query.limit === undefined ? 25 : Number(req.query.limit), req.query.cursor as string | undefined));
+    } else {
+      res.json(await service.listActivity(endpointId(req)));
+    }
   });
 
   router.post(
@@ -394,7 +645,11 @@ export function chatChannelRoutes(db: Db, options: ChatChannelRouteOptions) {
 
   router.get("/issues/:issueId/chat-binding", async (req, res) => {
     assertBoard(req);
-    const binding = await service.getIssueBinding(req.params.issueId as string);
+    const issueId = req.params.issueId as string;
+    if (issueId !== issueId.trim() || !isUuidLike(issueId)) {
+      throw badRequest("Task ID must be a UUID");
+    }
+    const binding = await service.getIssueBinding(issueId);
     if (binding) {
       const endpoint = await getAccessibleResource(
         req,
@@ -482,7 +737,7 @@ export function chatWebhookRoutes(
       });
     }
     const provider = req.params.provider as ChatProvider;
-    if (!CHAT_PROVIDERS.includes(provider) || provider === "agentmail")
+    if (!CHAT_PROVIDERS.includes(provider) || provider === "agentmail" || provider === "speko")
       throw badRequest("Unsupported chat provider");
     const response = await service.handleWebhook(
       req.params.publicId as string,

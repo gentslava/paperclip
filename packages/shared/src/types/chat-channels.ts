@@ -1,3 +1,10 @@
+import type { TaskWorkspaceSelection } from "./task-workspace.js";
+
+export interface ChatExecutionDefaults {
+  projectId?: string | null;
+  workspace?: TaskWorkspaceSelection | null;
+}
+
 /** Provider-neutral contracts for Paperclip's native external chat subsystem. */
 export const CHAT_PROVIDERS = [
   "slack",
@@ -5,7 +12,9 @@ export const CHAT_PROVIDERS = [
   "discord",
   "microsoft-teams",
   "telegram",
+  "speko",
   "agentmail",
+  "imessage-photon",
 ] as const;
 export type ChatProvider = (typeof CHAT_PROVIDERS)[number];
 
@@ -157,6 +166,7 @@ export interface ChatEndpointBehaviorPolicy {
   /** Defaults to queue and is not exposed in the initial settings UI. */
   concurrency: ChatConcurrencyPolicy;
   allowDirectMessages: boolean;
+  requireAtMention: boolean;
   allowGroupChats: boolean;
   allowUnlinkedPeople: boolean;
 }
@@ -180,15 +190,49 @@ export interface ChatEndpointCallbackSurfaces {
   slashCommands: ChatEndpointCallbackSurfaceState;
 }
 
+export interface SlackAppConfiguration {
+  appName: string;
+  botName: string;
+  command: string;
+}
+
 export interface ChatEndpointSetupState {
+  slackSetupMethod?: "managed" | "automatic" | "manual" | "existing";
+  slackManagerError?: string;
+  slackRegistration?: import("../slack-app-manifest.js").SlackRegistrationState;
+  /** Provider-confirmed app icon outcome; configuration tokens are never retained. */
+  slackAvatar?: import("../slack-app-manifest.js").SlackAvatarState;
+  slackAccount?: import("../slack-app-manifest.js").SlackAccountState;
+  slackOAuthCallbackUri?: string | null;
+  github?: {
+    stage: "setup" | "connect" | "install" | "repositories" | "verify" | "identity" | "behavior" | "test";
+    appSlug?: string;
+    /** Verified by GitHub GET /app, distinct from draft ownership choices. */
+    appOwnerType?: "personal" | "organization";
+    appOwnerLogin?: string;
+    installationUrl?: string;
+    managementUrl?: string;
+    registrationStatus?: "pending" | "completed" | "failed";
+    ownerType?: "personal" | "organization";
+    ownerLogin?: string;
+    appName?: string;
+    cloudRegistrationId?: string;
+    initialRepositoriesImported?: boolean;
+    repositorySelectionSaved?: boolean;
+    initialRepositoryImportPending?: boolean;
+    initialSetupPending?: boolean;
+  };
   step: "choose_agent" | "provider_setup" | "test" | "complete";
   /** Server-generated boundary; only provider events at or after this time can complete setup. */
   testStartedAt?: string | null;
+  /** Onboarding was finished without requiring a full conversation test. */
+  testSkipped?: boolean;
   /** Set only after the provider has delivered a signed callback challenge. */
   webhookVerifiedAt?: string | null;
   authorizationUrl?: string | null;
   providerUrl?: string | null;
   command?: string | null;
+  slackApp?: SlackAppConfiguration;
   webhookUrl?: string | null;
   messagingEndpoint?: string | null;
   /** Safe presence signal only; the secret value is returned once by its generation endpoint. */
@@ -207,6 +251,9 @@ export type ChannelPublicationMode = "automatic" | "explicit";
 export type ExternalMessageExecutionPolicy = "restricted" | "agent";
 
 export interface ChatEndpoint {
+  executionDefaults?: ChatExecutionDefaults | null;
+  /** Additional presentation instructions captured only for newly created tasks. */
+  communicationInstructions?: string;
   id: string;
   companyId: string;
   connectionId: string;
@@ -226,7 +273,9 @@ export interface ChatEndpoint {
   botUsername?: string | null;
   botLabel?: string | null;
   botAvatarUrl?: string | null;
+  photonAllocation?: "dedicated" | "shared";
   allowDirectMessages: boolean;
+  requireAtMention: boolean;
   allowGroupChats: boolean;
   allowUnlinkedPeople: boolean;
   replyMode: "subscribed";
@@ -242,6 +291,7 @@ export interface ChatEndpoint {
 }
 
 export interface ChatEndpointResource {
+  executionDefaults?: ChatExecutionDefaults | null;
   id: string;
   companyId: string;
   endpointId: string;
@@ -255,6 +305,15 @@ export interface ChatEndpointResource {
   enabled: boolean;
   createdAt: string;
   updatedAt: string;
+  participants?: string[];
+}
+
+export interface GitHubRepositoryPage {
+  items: ChatEndpointResource[];
+  nextOffset: number | null;
+  totalCount: number;
+  enabledCount: number;
+  availableCount: number;
 }
 
 export interface ChatExternalPrincipal {
@@ -276,10 +335,13 @@ export interface ChatIdentityLink {
   companyId: string;
   endpointId: string;
   principalId: string;
+  /** Latest discovery-only connect command received by this endpoint. */
+  lastConnectAt?: string | null;
   externalLabel: string;
   externalDetail?: string | null;
   paperclipUserId?: string | null;
   paperclipUserLabel?: string | null;
+  paperclipUserImage?: string | null;
   status: ChatIdentityLinkStatus;
   expiresAt?: string | null;
   confirmedAt?: string | null;
@@ -347,6 +409,14 @@ export interface SafeExternalChatCard {
   title: string;
   body?: string;
   actions?: SafeExternalChatCardAction[];
+  /** A compact choice whose opaque option tokens use the normal action ledger. */
+  selection?: {
+    actionId: string;
+    label: string;
+    multiple?: boolean;
+    submitLabel?: string;
+    options: Array<{ actionId: string; label: string; description?: string; selected?: boolean }>;
+  };
 }
 
 export interface SafeChatPublicationPayload {
@@ -456,10 +526,17 @@ export interface CreateChatEndpointInput {
   assignedAgentId: string;
   applicationId?: string;
   name?: string;
+  slackApp?: SlackAppConfiguration;
+  slackSetupMethod?: "managed" | "automatic" | "manual" | "existing";
 }
 
 export interface UpdateChatEndpointInput {
+  executionDefaults?: ChatExecutionDefaults | null;
+  slackSetupMethod?: "managed" | "automatic" | "manual" | "existing";
+  slackApp?: SlackAppConfiguration;
+  communicationInstructions?: string;
   allowDirectMessages?: boolean;
+  requireAtMention?: boolean;
   allowGroupChats?: boolean;
   allowUnlinkedPeople?: boolean;
 }
@@ -467,6 +544,7 @@ export interface UpdateChatEndpointInput {
 export interface ConfigureChatEndpointInput {
   action: "configure" | "verify" | "pause" | "resume" | "reconnect" | "remove";
   credentials?: Record<string, string>;
+  photon?: PhotonChannelConfiguration;
 }
 
 export interface NormalizedChatEvent {
@@ -503,3 +581,15 @@ export interface NormalizedChatEvent {
   };
   raw: Record<string, unknown>;
 }
+
+/** Safe Photon project inspection; credentials and line tokens are never serialized. */
+export interface PhotonProjectInspection {
+  projectId: string;
+  projectName: string;
+  allocation: "dedicated" | "shared";
+  eligible: boolean;
+  lines: Array<{ lineId: string; phoneNumber: string; eligible: boolean; unavailableReason?: string }>;
+}
+export type PhotonChannelConfiguration =
+  | { allocation?: "dedicated"; projectId: string; lineId: string }
+  | { allocation: "shared"; projectId: string };

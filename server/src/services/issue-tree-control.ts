@@ -23,6 +23,7 @@ import {
 } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import type { IssuePostCommitAction } from "./issues.js";
+import { notifyTerminalWorkspaceWork } from "./terminal-workspace-work.js";
 
 type IssueRow = typeof issues.$inferSelect;
 type HoldRow = typeof issueTreeHolds.$inferSelect;
@@ -714,6 +715,12 @@ export function issueTreeControlService(db: Db) {
     preview: IssueTreeControlPreview;
     resumedPauseHoldIds?: string[];
   }> {
+    if (input.mode === "cancel") {
+      const [conversation] = await db.select({ id: issues.id }).from(issues).where(and(
+        eq(issues.id, rootIssueId), eq(issues.companyId, companyId), sql`${issues.conversationAgentId} is not null`,
+      ));
+      if (conversation) throw unprocessable("Stop the active reply instead of cancelling the persistent conversation");
+    }
     const holdReleasePolicy = normalizeReleasePolicy(input.releasePolicy);
     const holdPreview = await preview(companyId, rootIssueId, {
       mode: input.mode,
@@ -971,6 +978,7 @@ export function issueTreeControlService(db: Db) {
       const restored: TreeStatusUpdateResult["updatedIssues"] = [];
       for (const [status, issueIdsForStatus] of issueIdsByStatus) {
         if (issueIdsForStatus.length === 0) continue;
+        for (const issueId of issueIdsForStatus) await notifyTerminalWorkspaceWork(tx, `issue:${issueId}`);
         const rows = await tx
           .update(issues)
           .set({

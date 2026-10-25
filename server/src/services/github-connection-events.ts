@@ -1,3 +1,5 @@
+import { dispatchGitHubBotCloudEvent } from "./chat-github-cloud-ingress.js";
+import { chatEndpoints } from "@paperclipai/db";
 import { randomUUID } from "node:crypto";
 import {
   connectionEventDeliveries,
@@ -462,8 +464,9 @@ export function githubConnectionEventService(
         return { leased: 0, processed: 0, duplicate: 0, ignored: 0, failed: 0 };
       }
       const bindings = await activeBindings();
-      if (bindings.length === 0) {
-        nextPollAt = now().getTime() + 5 * 60_000;
+      const bots = await db.select().from(chatEndpoints).where(and(eq(chatEndpoints.provider, "github"), sql`${chatEndpoints.setup}->'github'->>'cloudRegistrationId' is not null`, sql`${chatEndpoints.status} <> 'archived'`));
+      if (bindings.length === 0 && bots.length === 0) {
+        nextPollAt = now().getTime() + 5_000;
         return { leased: 0, processed: 0, duplicate: 0, ignored: 0, failed: 0 };
       }
       const config = options.connector ? null : paperclipCloudConnectorConfigFromEnv(options.env);
@@ -472,24 +475,29 @@ export function githubConnectionEventService(
         nextPollAt = now().getTime() + 5 * 60_000;
         return { leased: 0, processed: 0, duplicate: 0, ignored: 0, failed: 0 };
       }
-      const first = bindings[0]!;
+      const first = bindings[0] ?? { subject: "github-bot-events", companyId: bots[0]!.companyId };
       const lease = await connector.leaseEvents({ subject: first.subject, companyId: first.companyId });
       if (!lease) {
         emptyPolls += 1;
-        nextPollAt = now().getTime() + Math.min(5 * 60_000, 5_000 * (2 ** Math.min(emptyPolls, 6)));
+        nextPollAt = now().getTime() + Math.min(bots.length ? 15_000 : 5 * 60_000, 5_000 * (2 ** Math.min(emptyPolls, 6)));
         return { leased: 0, processed: 0, duplicate: 0, ignored: 0, failed: 0 };
       }
       emptyPolls = 0;
       nextPollAt = now().getTime() + 5_000;
       const result: GitHubConnectionEventPollResult = {
-        leased: lease.events.length,
+        leased: lease.events.length + (lease.failedEventIds?.length ?? 0),
         processed: 0,
         duplicate: 0,
         ignored: 0,
-        failed: 0,
+        failed: lease.failedEventIds?.length ?? 0,
       };
       const acknowledge: string[] = [];
       for (const event of lease.events) {
+        if (event.payload.githubApp !== undefined) {
+          try { await dispatchGitHubBotCloudEvent(db, event); acknowledge.push(event.id); result.processed += 1; }
+          catch { result.failed += 1; }
+          continue;
+        }
         const matched = bindings.filter((binding) => event.bindingIds.includes(binding.id));
         if (matched.length === 0) {
           result.ignored += 1;
@@ -526,6 +534,10 @@ export function githubConnectionEventService(
           leaseId: lease.leaseId,
           deliveryIds: acknowledge,
         });
+      }
+      for (const deliveryId of lease.failedEventIds ?? []) {
+        logger.warn({ deliveryId, reason: "inner_event_authentication_failed" },
+          "GitHub connector event retained for retry");
       }
       return result;
     },

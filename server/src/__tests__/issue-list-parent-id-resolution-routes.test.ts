@@ -157,14 +157,14 @@ describe("GET /api/companies/:companyId/issues — parentId / descendantOf resol
     expect(mockIssueService.list).not.toHaveBeenCalled();
   });
 
-  it("returns 400 with invalid_parent_id (echoing the trimmed value) for garbage parentId", async () => {
+  it("keeps upstream validation for for garbage parentId", async () => {
     const app = await createApp();
     const res = await request(app)
       .get("/api/companies/company-1/issues")
       .query({ parentId: "  not-a-uuid-or-identifier  " });
 
-    expect(res.status).toBe(400);
-    expect(res.body).toEqual({ error: "invalid_parent_id", value: "not-a-uuid-or-identifier" });
+    expect(res.status).toBe(422);
+    expect(res.body).toEqual({ error: "parentId must be a UUID" });
     expect(mockIssueService.list).not.toHaveBeenCalled();
   });
 
@@ -201,14 +201,14 @@ describe("GET /api/companies/:companyId/issues — parentId / descendantOf resol
     expect(mockIssueService.list).not.toHaveBeenCalled();
   });
 
-  it("returns 400 with invalid_descendant_of for garbage descendantOf", async () => {
+  it("keeps upstream validation for for garbage descendantOf", async () => {
     const app = await createApp();
     const res = await request(app)
       .get("/api/companies/company-1/issues")
       .query({ descendantOf: "lower-case-words" });
 
-    expect(res.status).toBe(400);
-    expect(res.body).toEqual({ error: "invalid_descendant_of", value: "lower-case-words" });
+    expect(res.status).toBe(422);
+    expect(res.body).toEqual({ error: "descendantOf must be a UUID" });
     expect(mockIssueService.list).not.toHaveBeenCalled();
   });
 
@@ -236,7 +236,7 @@ describe("GET /api/companies/:companyId/issues — parentId / descendantOf resol
   // Regression: with Express' default query parser, repeated query params
   // (e.g. `?parentId=a&parentId=b`) arrive as arrays at runtime. The pre-fix
   // code cast them to `string` and then called `.trim()`, which threw a 500.
-  // These tests lock in the explicit 400 for both filters, on both endpoints.
+  // These tests lock in the upstream 422 validation for both filters, on both endpoints.
   //
   // Note on object shapes: `?parentId[eq]=x` would produce an object under
   // `req.query.parentId` only if the app opts into Express' "extended" query
@@ -244,60 +244,48 @@ describe("GET /api/companies/:companyId/issues — parentId / descendantOf resol
   // that bracket form arrives as a literal `parentId[eq]` key and never hits
   // this validator; the runtime-type guard remains as a defence-in-depth for
   // a possible future parser switch.
-  it("returns 400 (not 500) when parentId is repeated in the query", async () => {
+  it("returns 422 (not 500) when parentId is repeated in the query", async () => {
     const app = await createApp();
     const res = await request(app)
       .get("/api/companies/company-1/issues")
       .query(`parentId=${parentUuid}&parentId=other-value`);
 
-    expect(res.status).toBe(400);
-    expect(res.body).toEqual({
-      error: "invalid_parent_id",
-      reason: "expected a single string value, received a repeated or structured query parameter",
-    });
+    expect(res.status).toBe(422);
+    expect(res.body).toEqual({ error: "parentId must be a UUID" });
     expect(mockIssueService.list).not.toHaveBeenCalled();
     expect(mockIssueService.getByIdentifier).not.toHaveBeenCalled();
   });
 
-  it("returns 400 (not 500) when descendantOf is repeated in the query", async () => {
+  it("returns 422 (not 500) when descendantOf is repeated in the query", async () => {
     const app = await createApp();
     const res = await request(app)
       .get("/api/companies/company-1/issues")
       .query(`descendantOf=${parentUuid}&descendantOf=${parentIdentifier}`);
 
-    expect(res.status).toBe(400);
-    expect(res.body).toEqual({
-      error: "invalid_descendant_of",
-      reason: "expected a single string value, received a repeated or structured query parameter",
-    });
+    expect(res.status).toBe(422);
+    expect(res.body).toEqual({ error: "descendantOf must be a UUID" });
     expect(mockIssueService.list).not.toHaveBeenCalled();
   });
 
-  it("returns 400 (not 500) when parentId is repeated on GET /issues/count", async () => {
+  it("returns 422 (not 500) when parentId is repeated on GET /issues/count", async () => {
     const app = await createApp();
     const res = await request(app)
       .get("/api/companies/company-1/issues/count")
       .query(`attention=blocked&parentId=${parentUuid}&parentId=other`);
 
-    expect(res.status).toBe(400);
-    expect(res.body).toEqual({
-      error: "invalid_parent_id",
-      reason: "expected a single string value, received a repeated or structured query parameter",
-    });
+    expect(res.status).toBe(422);
+    expect(res.body).toEqual({ error: "parentId must be a UUID" });
     expect(mockIssueService.count).not.toHaveBeenCalled();
   });
 
-  it("returns 400 (not 500) when descendantOf is repeated on GET /issues/count", async () => {
+  it("returns 422 (not 500) when descendantOf is repeated on GET /issues/count", async () => {
     const app = await createApp();
     const res = await request(app)
       .get("/api/companies/company-1/issues/count")
       .query(`attention=blocked&descendantOf=${parentUuid}&descendantOf=x`);
 
-    expect(res.status).toBe(400);
-    expect(res.body).toEqual({
-      error: "invalid_descendant_of",
-      reason: "expected a single string value, received a repeated or structured query parameter",
-    });
+    expect(res.status).toBe(422);
+    expect(res.body).toEqual({ error: "descendantOf must be a UUID" });
     expect(mockIssueService.count).not.toHaveBeenCalled();
   });
 
@@ -307,11 +295,8 @@ describe("GET /api/companies/:companyId/issues — parentId / descendantOf resol
       .get("/api/companies/company-1/issues")
       .query(`parentIssueId=${parentUuid}&parentIssueId=other`);
 
-    expect(res.status).toBe(400);
-    expect(res.body).toEqual({
-      error: "invalid_parent_id",
-      reason: "expected a single string value, received a repeated or structured query parameter",
-    });
+    expect(res.status).toBe(422);
+    expect(res.body).toEqual({ error: "parentIssueId must be a UUID" });
     expect(mockIssueService.list).not.toHaveBeenCalled();
   });
 });

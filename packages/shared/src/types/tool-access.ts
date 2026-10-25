@@ -68,8 +68,8 @@ export type {
 
 export type ToolActorType = "agent" | "user" | "system" | "plugin";
 export type ToolConnectionTransport =
-  "mcp_remote" | "rest_api" | "local_stdio" | "chat_sdk";
-export type ToolConnectionPurpose = "tool" | "channel";
+  "mcp_remote" | "rest_api" | "local_stdio" | "chat_sdk" | "runtime_auth" | "voice";
+export type ToolConnectionPurpose = "tool" | "channel" | "ai";
 export type ToolConnectionAuthKind = "oauth" | "api_key" | "none";
 export type ToolConnectionOwnership =
   "platform_shared" | "platform_provisioned" | "customer" | "dcr";
@@ -165,6 +165,7 @@ export interface ToolApplication {
 }
 
 export interface ToolConnection {
+  agentInstructions?: import("../connection-instructions.js").ConnectionAgentInstructions | null;
   id: string;
   companyId: string;
   applicationId: string;
@@ -182,6 +183,8 @@ export interface ToolConnection {
   transportConfig: Record<string, unknown>;
   config?: Record<string, unknown>;
   credentialSecretRefs: ToolCredentialSecretRef[];
+  /** Saved client secret for the requesting user, or the shared connection. Never includes secret material. */
+  hasSavedOAuthClientSecret?: boolean;
   credentialRefs?: McpConnectionCredentialRef[];
   healthStatus: ToolConnectionHealthStatus;
   /** Managed GitHub grant state; transient health failures do not require sign-in. */
@@ -216,6 +219,20 @@ export interface ConnectionGrant {
       strategy?: string;
       accessTokenExpiresAt?: string | null;
       scopes?: string[];
+      /**
+       * Whether `scopes` is what the provider asserted, or only what we requested.
+       * `requested_fallback` means the token response carried no `scope`, so the value is
+       * inferred from the request per RFC 6749 §5.1 and is not a provider assertion.
+       */
+      scopeSource?: "provider" | "requested_fallback";
+      /** Scopes the provider asserted that we never asked for. Empty unless it over-granted. */
+      unrequestedScopes?: string[];
+      /**
+       * The scopes the authorization URL sent for *this* grant, kept per-grant because two
+       * users can authorize the same connection with different scopes. A refresh has no fresh
+       * request, so this is the baseline its response is judged against.
+       */
+      requestedScopes?: string[];
       tokenType?: string;
       refreshTokenExpiresAt?: string;
       refreshedAt?: string;
@@ -224,6 +241,7 @@ export interface ConnectionGrant {
         expiresAt?: string;
       };
     };
+    slackSearch?: { endpointId: string; workspaceId: string; slackUserId: string; clientRevision: string };
     github?: {
       userId: string;
       login: string;
@@ -238,6 +256,7 @@ export interface ConnectionGrant {
         id: string;
         fullName: string;
         installationId: string;
+        ownerType?: "personal" | "organization";
         private?: boolean;
       }>;
       installationUrl?: string;
@@ -1657,6 +1676,17 @@ export interface ToolConnectionTestAgentAccessResponse {
   access: ToolConnectionAccessSummary;
 }
 
+export interface ToolUpstreamPending {
+  kind: "authorization" | "approval";
+  links: Array<{ url: string; host: string; elicitationId?: string }>;
+  executionId?: string;
+  elicitationId?: string;
+  resumeTool?: string;
+  expiresAt?: string;
+  message?: string;
+  requestedSchema?: Record<string, unknown>;
+}
+
 /** Result of `POST /tool-connections/:id/test-calls`. */
 export interface ToolConnectionTestCallResult {
   decision: ToolConnectionTestDecision;
@@ -1667,6 +1697,8 @@ export interface ToolConnectionTestCallResult {
   error?: { message: string; reasonCode: ToolAccessReasonCode | string | null };
   /** Present (with `decision: "ask_first"`) — the parked approval request. */
   actionRequestId?: string;
+  /** Provider handoff, distinct from a Paperclip permission approval. */
+  upstreamPending?: ToolUpstreamPending;
 }
 
 /**
@@ -1692,6 +1724,7 @@ export interface ToolConnectionTestCallStatus {
   parameters?: Record<string, unknown> | null;
   /** Present once `phase === "done"` and the tool succeeded. */
   result?: unknown;
+  upstreamPending?: ToolUpstreamPending;
   /** Present once `phase === "done"` and the tool failed, or when the request was denied/expired. */
   error?: { message: string; reasonCode: ToolAccessReasonCode | string | null };
   /** Wall-clock duration of the executed call in ms, when known. */

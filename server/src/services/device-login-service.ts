@@ -1,3 +1,5 @@
+import { writeLoginCleanup } from "./login-cleanup-notifications.js";
+import { DELIVERY_QUEUES } from "./delivery-work-notifications.js";
 import { randomUUID } from "node:crypto";
 import { and, eq, inArray, isNotNull, isNull, lte, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -208,6 +210,7 @@ export interface LoginSessionActivityEvent {
 export type LoginSessionActivityRecorder = (event: LoginSessionActivityEvent) => void;
 
 export interface StartDeviceLoginInput {
+  aiConnection?: import("@paperclipai/shared").AiConnectionLoginIntent;
   companyId: string;
   environmentId: string;
   adapterType: AgentAdapterType;
@@ -262,6 +265,7 @@ export class AdapterAuthSessionConflictError extends Error {
 // ---------------------------------------------------------------------------
 
 export interface AdapterAuthSessionRow {
+  aiConnection?: import("@paperclipai/shared").AiConnectionLoginIntent;
   id: string;
   /** The public, CSPRNG session identifier. The API returns and looks up this
    *  value. It never equals the internal primary-key `id`, so a caller cannot
@@ -286,6 +290,7 @@ export interface AdapterAuthSessionRow {
 }
 
 export interface InsertAdapterAuthSessionInput {
+  aiConnection?: import("@paperclipai/shared").AiConnectionLoginIntent;
   id: string;
   /** The public, CSPRNG session identifier. The service builds it and returns it
    *  to the client; the store persists it in `public_session_id`. */
@@ -486,6 +491,7 @@ function isUniqueViolation(error: unknown): boolean {
 function toRow(row: typeof adapterAuthSessions.$inferSelect): AdapterAuthSessionRow {
   return {
     id: row.id,
+    ...(row.aiConnection ? { aiConnection: row.aiConnection } : {}),
     publicSessionId: row.publicSessionId,
     companyId: row.companyId,
     environmentId: row.environmentId,
@@ -528,12 +534,13 @@ export function createDbAdapterAuthSessionStore(
   return {
     async insert(input) {
       try {
-        await db.insert(adapterAuthSessions).values({
+        await writeLoginCleanup(db, DELIVERY_QUEUES.adapterLoginCleanup, tx => tx.insert(adapterAuthSessions).values({
           id: input.id,
           companyId: input.companyId,
           environmentId: input.environmentId,
           adapterType: input.adapterType,
           startedByUserId: input.startedByUserId,
+          aiConnection: input.aiConnection,
           // The unified table requires a unique public session id. The service
           // builds it from a CSPRNG and returns it to the client, so the store
           // persists that value here. It never uses the internal id, a timestamp,
@@ -543,7 +550,7 @@ export function createDbAdapterAuthSessionStore(
           expiresAt: input.expiresAt,
           createdAt: input.at,
           updatedAt: input.at,
-        });
+        }));
       } catch (error) {
         if (isUniqueViolation(error)) {
           throw new AdapterAuthSessionConflictError();
@@ -552,23 +559,23 @@ export function createDbAdapterAuthSessionStore(
       }
     },
     async recordLeaseAcquired(input) {
-      await db
+      await writeLoginCleanup(db, DELIVERY_QUEUES.adapterLoginCleanup, tx => tx
         .update(adapterAuthSessions)
         .set({ providerLeaseId: input.providerLeaseId, updatedAt: input.at })
-        .where(eq(adapterAuthSessions.id, input.sessionId));
+        .where(eq(adapterAuthSessions.id, input.sessionId)));
     },
     async setStatus(input) {
-      await db
+      await writeLoginCleanup(db, DELIVERY_QUEUES.adapterLoginCleanup, tx => tx
         .update(adapterAuthSessions)
         .set(buildStatusPatch(input))
-        .where(eq(adapterAuthSessions.id, input.sessionId));
+        .where(eq(adapterAuthSessions.id, input.sessionId)));
     },
     async compareAndSetStatus(input) {
       // The conditional write. It changes the row only when the current status is
       // one of `expectedStatuses`. The `returning` clause reports the changed
       // rows, so a lost race returns an empty array. The active-slot partial
       // unique index still serializes the company slot on the write.
-      const changed = await db
+      const changed = await writeLoginCleanup(db, DELIVERY_QUEUES.adapterLoginCleanup, tx => tx
         .update(adapterAuthSessions)
         .set(buildStatusPatch(input))
         .where(
@@ -577,7 +584,7 @@ export function createDbAdapterAuthSessionStore(
             inArray(adapterAuthSessions.status, [...input.expectedStatuses]),
           ),
         )
-        .returning({ id: adapterAuthSessions.id });
+        .returning({ id: adapterAuthSessions.id }));
       return changed.length > 0;
     },
     async get(sessionId) {
@@ -644,6 +651,7 @@ export function createDbAdapterAuthSessionStore(
             // The shared table also holds the setup-token rows, so every reaper
             // scan filters by the closed set of displayed-code adapter types.
             inArray(adapterAuthSessions.adapterType, DISPLAYED_CODE_ADAPTER_TYPES),
+            sql`${adapterAuthSessions.connectionMethod} is distinct from 'local_subscription'`,
             inArray(adapterAuthSessions.status, [...ADAPTER_AUTH_ACTIVE_STATUSES]),
             isNotNull(adapterAuthSessions.expiresAt),
             lte(adapterAuthSessions.expiresAt, nowAt),
@@ -663,6 +671,7 @@ export function createDbAdapterAuthSessionStore(
         .where(
           and(
             inArray(adapterAuthSessions.adapterType, DISPLAYED_CODE_ADAPTER_TYPES),
+            sql`${adapterAuthSessions.connectionMethod} is distinct from 'local_subscription'`,
             eq(adapterAuthSessions.status, "cleanup_pending"),
           ),
         );
@@ -934,6 +943,7 @@ export function createDeviceLoginService(deps: DeviceLoginServiceDeps) {
       environmentId: input.environmentId,
       adapterType: input.adapterType,
       startedByUserId: input.startedByUserId,
+      aiConnection: input.aiConnection,
       expiresAt,
       at: startedAt,
     });
@@ -1307,6 +1317,7 @@ export function createDeviceLoginService(deps: DeviceLoginServiceDeps) {
     const prompt = isOwner ? promptsBySession.get(row.id) ?? null : null;
     return {
       sessionId: row.publicSessionId,
+      ...(isOwner && row.aiConnection ? { aiConnection: row.aiConnection } : {}),
       environmentId: row.environmentId,
       status,
       expiresAt: row.expiresAt?.toISOString() ?? null,
@@ -1644,10 +1655,10 @@ export function createProductionLoginSessionRuntime(
       );
       // Tag the lease with the session identifier, so the reaper resolves an
       // orphan lease that no live session references. The tag carries no secret.
-      await environmentsSvc.updateLeaseMetadata(record.lease.id, {
+      await writeLoginCleanup(deps.db, DELIVERY_QUEUES.adapterLoginCleanup, tx => environmentService(tx).updateLeaseMetadata(record.lease.id, {
         ...(record.lease.metadata ?? {}),
         [LOGIN_LEASE_SESSION_TAG_KEY]: input.sessionId,
-      });
+      }));
       const sessionHome = sessionLoginHomePath(input.sessionId);
       const authPath = sessionCredentialPath(input.sessionId);
       const providerLeaseId = record.lease.providerLeaseId ?? record.lease.id;

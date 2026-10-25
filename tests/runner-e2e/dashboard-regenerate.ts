@@ -2,6 +2,7 @@ import path from "node:path";
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { runnerMatrix } from "./catalog.js";
 import { renderRunnerE2EDashboard } from "./dashboard.js";
+import { campaignFeedbackReviewText } from "./feedback-dispositions.js";
 import {
   buildRunnerCampaign,
   canonicalExecutionId,
@@ -21,9 +22,14 @@ interface PublishedResult extends RunnerE2EResult {
 interface PublishedCampaign {
   schema?: string;
   campaignId?: string;
+  source?: RunnerE2ECampaign["source"];
   generatedAt: string;
   expected: string[];
   results: PublishedResult[];
+  accounting?: RunnerE2ECampaign["accounting"];
+  operations?: RunnerE2ECampaign["operations"];
+  feedbackReview?: RunnerE2ECampaign["feedbackReview"];
+  braintrustExperiment?: RunnerE2ECampaign["braintrustExperiment"];
 }
 
 async function relativeFiles(root: string, current = root): Promise<string[]> {
@@ -56,7 +62,7 @@ export async function regenerateRunnerDashboard(input: {
   historyFile?: string | null;
   outputDirectory?: string;
   evidenceHrefPrefix?: string;
-  publicSummaryImageHref?: string;
+  feedbackReviewFile?: string;
 }) {
   const bundle = path.resolve(input.bundle);
   const outputDirectory = path.resolve(input.outputDirectory ?? bundle);
@@ -93,7 +99,23 @@ export async function regenerateRunnerDashboard(input: {
     generatedAt: normalized.generatedAt,
     expected,
     results,
+    accounting: normalized.accounting,
+    operations: normalized.operations,
+    braintrustExperiment: normalized.braintrustExperiment,
+    feedbackReview: input.feedbackReviewFile
+      ? JSON.parse(await readFile(input.feedbackReviewFile, "utf8"))
+      : normalized.feedbackReview,
   });
+  // A rendering refresh must not inherit the renderer's checkout or CI event.
+  const retainedSource = results.find((result) =>
+    result.source?.sha || result.source?.ref || result.source?.workflowRunUrl,
+  )?.source;
+  campaign.source = normalized.source ?? {
+    sha: retainedSource?.sha ?? null,
+    ref: retainedSource?.ref ?? null,
+    workflowRunUrl: retainedSource?.workflowRunUrl ?? null,
+    eventName: null,
+  };
   const history =
     input.historyFile === null
       ? undefined
@@ -131,8 +153,8 @@ export async function regenerateRunnerDashboard(input: {
       return {
         result,
         valid:
-          publishedResult.evidenceValid ??
-          (result.status === "passed" && result.cleanup === "passed"),
+          result.status === "passed" && result.cleanup === "passed" &&
+          publishedResult.evidenceValid !== false,
         errors: publishedResult.evidenceErrors ?? [],
         evidenceBaseHref,
         evidenceFiles,
@@ -147,7 +169,6 @@ export async function regenerateRunnerDashboard(input: {
     entries,
     campaign,
     history,
-    publicSummaryImageHref: input.publicSummaryImageHref,
   });
   const upgraded = {
     ...campaign,
@@ -159,10 +180,21 @@ export async function regenerateRunnerDashboard(input: {
       evidenceErrors: normalized.results[index]?.evidenceErrors ?? [],
     })),
   };
+  const summary = await readFile(path.join(bundle, "summary.md"), "utf8").then(text => text.replace(
+    /^(Feedback across retained attempts:.*?); [0-9]+ distinct items awaiting review;/m, "$1;",
+  )).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return undefined;
+    throw error;
+  });
+  const reviewStatus = /^(?:[0-9]+ distinct feedback items await review\.|Feedback reviewed by (?:human|agent) at ).*$/m;
+  const refreshedSummary = summary === undefined ? undefined : reviewStatus.test(summary)
+    ? summary.replace(reviewStatus, () => campaignFeedbackReviewText(campaign))
+    : `${summary.trimEnd()}\n\n## Campaign feedback review\n\n${campaignFeedbackReviewText(campaign)}\n`;
   await mkdir(outputDirectory, { recursive: true });
   await Promise.all([
     writeFile(path.join(outputDirectory, "index.html"), dashboard, "utf8"),
     writeFile(path.join(outputDirectory, "dashboard.html"), dashboard, "utf8"),
+    ...(refreshedSummary === undefined ? [] : [writeFile(path.join(outputDirectory, "summary.md"), refreshedSummary, "utf8")]),
     writeFile(
       path.join(outputDirectory, "normalized-results.json"),
       `${JSON.stringify(upgraded, null, 2)}\n`,
@@ -183,7 +215,7 @@ async function main() {
   );
   if (!bundleArgument) {
     throw new Error(
-      "Usage: pnpm test:e2e:runner:dashboard -- <published-bundle-directory> [--history <history.json>]",
+      "Usage: pnpm test:e2e:runner:dashboard -- <published-bundle-directory> [--history <history.json>] [--feedback-review <review.json>]",
     );
   }
   const historyIndex = arguments_.indexOf("--history");
@@ -191,7 +223,10 @@ async function main() {
     historyIndex >= 0 ? arguments_[historyIndex + 1] : undefined;
   if (historyIndex >= 0 && !historyFile)
     throw new Error("--history requires a path");
-  await regenerateRunnerDashboard({ bundle: bundleArgument, historyFile });
+  const reviewIndex = arguments_.indexOf("--feedback-review");
+  const feedbackReviewFile = reviewIndex >= 0 ? arguments_[reviewIndex + 1] : undefined;
+  if (reviewIndex >= 0 && !feedbackReviewFile) throw new Error("--feedback-review requires a path");
+  await regenerateRunnerDashboard({ bundle: bundleArgument, historyFile, feedbackReviewFile });
 }
 
 if (
