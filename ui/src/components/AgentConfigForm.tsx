@@ -52,8 +52,9 @@ import { DEFAULT_OPENCODE_LOCAL_MODEL } from "@paperclipai/adapter-opencode-loca
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { NativeSelect, SelectPopover } from "@/components/ui/select";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { AdapterMark } from "./AdapterMark";
-import { FolderOpen, Heart, X, Copy, Check, ExternalLink, Loader2, TriangleAlert, Bug } from "lucide-react";
+import { ChevronDown, FolderOpen, Heart, X, Copy, Check, ExternalLink, Loader2, TriangleAlert, Bug } from "lucide-react";
 import { asBoolean, asFiniteNumber, asObject, cn } from "../lib/utils";
 import { copyTextToClipboard } from "../lib/clipboard";
 import {
