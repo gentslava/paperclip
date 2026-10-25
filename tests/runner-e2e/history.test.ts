@@ -32,6 +32,7 @@ import { renderRunnerHistoryIndex } from "./history-index.js";
 import { renderPublicCampaignSummary } from "./public-summary-image.js";
 import { isPublicRunnerScreenshotRoute } from "./screenshot-policy.js";
 import { connectionCheckpoints, type ConnectionEvidence } from "./connection-evidence.js";
+import { githubJourneyCheckpoints, type GitHubReviewJourneyEvidence } from "./github-review-evidence.js";
 import type { MatrixExecution, RunnerE2EResult } from "./types.js";
 
 const temporaryDirectories: string[] = [];
@@ -65,6 +66,12 @@ function result(execution: MatrixExecution, status: "passed" | "failed") {
     durationMs: 1_000,
     cleanup: "passed",
     ...(execution.task.flow === "provider_connection" ? { providerConnection: { version: 1, outcome: status, phase: "finished", assisted: false, authFreshness: "signed-in", target: { mode: "attach", origin: "http://127.0.0.1:3100", commit: "a".repeat(40), deploymentMode: "local_trusted" }, entry: "agent", method: "api-key", checkpoints: Object.fromEntries(connectionCheckpoints.map(key => [key, true])), waits: [] } satisfies ConnectionEvidence } : {}),
+    ...(execution.task.flow === "github_review_journey" ? { githubReviewJourney: {
+      version: 1, outcome: status, phase: "finished", setupId: "fixture", hosting: "self-hosted",
+      targetCommit: "a".repeat(40), assisted: false, dependencies: [],
+      checkpoints: Object.fromEntries(githubJourneyCheckpoints.map(key => [key, true])),
+      cleanup: { endpoint: true, pullRequest: true, branch: true, app: true },
+    } satisfies GitHubReviewJourneyEvidence } : {}),
   } satisfies RunnerE2EResult;
 }
 

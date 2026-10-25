@@ -10,6 +10,35 @@ export async function enterGitHubJourneyCompany(page: Page, origin: string, comp
   await page.waitForURL(url => url.origin === origin && url.pathname === pathname);
 }
 
+export async function assertGitHubJourneyCheck(page: Page, expected: { repository: string; url: string; headSha: string; score: number }, timeout = 30_000) {
+  let target: URL;
+  try { target = new URL(expected.url); }
+  catch { throw new ConnectionFailure("github_check_reference_mismatch"); }
+  const prefix = `/${expected.repository}/runs/`;
+  const id = target.pathname.startsWith(prefix) ? target.pathname.slice(prefix.length) : "";
+  if (target.origin !== "https://github.com" || target.username || target.password || target.search || target.hash
+    || !/^[1-9][0-9]*$/.test(id) || !/^[a-f0-9]{40,64}$/.test(expected.headSha)
+    || !Number.isInteger(expected.score) || expected.score < 1 || expected.score > 5) {
+    throw new ConnectionFailure("github_check_reference_mismatch");
+  }
+  await expect(page).toHaveURL(target.href, { timeout });
+  const check = page.locator(`#check_run_${id}`);
+  await expect(check.getByRole("heading", { name: `${expected.score}/5`, exact: true })).toBeVisible({ timeout });
+  // GitHub keeps a hidden "Re-run failed checks" menu item before the visible
+  // result. Only the selected check's status header can prove its conclusion.
+  await expect(check.locator(":scope > .border-bottom").getByText(/failed/i)).toBeVisible({ timeout });
+  await expect(check.getByText(expected.headSha, { exact: true })).toBeVisible({ timeout });
+}
+
+export async function assertGitHubJourneyTaskDone(page: Page, timeout = 30_000) {
+  const status = page.locator('[data-property-row="true"]:visible')
+    .filter({ has: page.locator('[data-property-label="Status"]') })
+    .locator('[data-property-value="true"]');
+  // Status glyphs contain SVG titles, and responsive layouts can retain hidden
+  // controls. Read the visible status picker rather than the first Done text.
+  await expect(status.getByRole("button", { name: "Change status (current: Done)", exact: true })).toBeVisible({ timeout });
+}
+
 export interface GitHubRegistrationBoundary {
   origin: string; pathname: string; passwordRequired: boolean; oneTimeCodeRequired: boolean;
   reauthenticationRequired: boolean; createControlVisible: boolean;

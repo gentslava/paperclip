@@ -20,6 +20,7 @@ import {
 import * as legacy from "../heartbeat.js";
 import * as extracted from "./run-state.js";
 import { readRunCancellation } from "../run-cancellation.js";
+import { decideQueuedCommentQueueSteering } from "../issue-queued-comment-queue.js";
 
 // SQL_ASCII needs a separate database cluster. Inspect its selected SQL here;
 // the PostgreSQL tests below exercise the session queries and transactions.
@@ -157,6 +158,64 @@ describePostgres("heartbeat run state database wiring", () => {
     const [issue] = await db.insert(issues).values({ companyId, title: "Session task", assigneeAgentId: agent.id }).returning();
     return { companyId, agent, issue, state: extracted.createHeartbeatRunState(db) };
   }
+
+  it("reads fresh issue control facts without transferring execution snapshots", async () => {
+    const { companyId, agent, issue } = await fixture();
+    const payload = randomBytes(128 * 1024).toString("base64");
+    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id, status: "running",
+      runtimeMode: "legacy", runtimeModeResolvedAt: null,
+      startedAt: new Date("2020-01-01T00:00:00Z"),
+      contextSnapshot: { issueId: issue.id, prompt: payload },
+      runnerProfileJson: { adapterDispatch: { adapterType: "paperclip_runner", adapterConfig: { prompt: payload } }, savedInput: payload },
+      resultJson: { stdout: payload }, stdoutExcerpt: payload, stderrExcerpt: payload,
+    }).returning();
+    const observed = createDb(database.connectionString);
+    const events: Array<Record<string, unknown>> = [], now = Date.now();
+    const capture = createDatabaseResponseCapture({ start: now - 100, end: now + 59_000 }, event => events.push(event));
+    installDatabaseResponseCapture(observed, { heartbeatRuns }, capture);
+    try {
+      const state = extracted.createHeartbeatRunState(observed);
+      const direct = await state.getRunIssueControl(run.id), active = await state.getActiveRunIssueControlForAgent(agent.id);
+      expect(active).toEqual(direct);
+      expect(direct).toEqual({ id: run.id, companyId, agentId: agent.id, status: "running", runtimeMode: "legacy",
+        runtimeModeResolvedAt: null, startedAt: run.startedAt, createdAt: run.createdAt,
+        contextSnapshot: { issueId: issue.id }, runnerProfileJson: { adapterDispatch: { adapterType: "paperclip_runner" } } });
+      capture.flush();
+      const summary = events.find(event => event.event === "paperclip.db_response_capture.summary.v1")!;
+      expect(summary.completedQueries).toBe(2);
+      expect(summary.responseValueBytes).toBeLessThan(2048);
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)))[0]).toEqual(run);
+      await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, run.id));
+      expect((await state.getRunIssueControl(run.id))?.status).toBe("failed");
+      expect(await state.getActiveRunIssueControlForAgent(agent.id)).toBeNull();
+      expect(await state.getActiveRunIssueControlForAgent(randomUUID())).toBeNull();
+      expect(await state.getRunIssueControl(randomUUID())).toBeNull();
+    } finally { capture.flush(); await observed.$client.end(); }
+  });
+
+  it("preserves native preparation, legacy steering, and typed issue context in issue control reads", async () => {
+    const { companyId, agent, issue, state } = await fixture();
+    for (const mode of ["native", "legacy"] as const) {
+      for (const value of [null, false, 42, [], {}, { nested: true }, "paperclip_runner", "process"]) {
+        const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id, status: "running", runtimeMode: mode,
+          contextSnapshot: { issueId: value }, runnerProfileJson: { adapterDispatch: { adapterType: value } },
+        }).returning();
+        const narrow = await state.getRunIssueControl(run.id), full = await state.getRun(run.id);
+        expect(narrow?.contextSnapshot?.issueId).toEqual(value);
+        expect(narrow?.runnerProfileJson).toEqual({ adapterDispatch: { adapterType: value } });
+        for (const queueState of ["queued", "deferred", null] as const) {
+          const facts = { state: queueState, queueRunRuntimeMode: mode, assignedAgentAdapterType: "paperclip_runner", queuedCommentCount: 1 };
+          expect(decideQueuedCommentQueueSteering({ ...facts, activeRun: narrow }))
+            .toEqual(decideQueuedCommentQueueSteering({ ...facts, activeRun: full }));
+        }
+        await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: issue.id }, runtimeModeResolvedAt: new Date("2020-01-01T00:00:00Z") })
+          .where(eq(heartbeatRuns.id, run.id));
+        const updated = await state.getRunIssueControl(run.id);
+        expect(updated?.contextSnapshot).toEqual({ issueId: issue.id });
+        expect(updated?.runtimeModeResolvedAt).toEqual(new Date("2020-01-01T00:00:00Z"));
+      }
+    }
+  });
 
   it("reads cleanup and workspace settlement without transferring saved input or changing the run", async () => {
     const { companyId, agent, issue, state } = await fixture();

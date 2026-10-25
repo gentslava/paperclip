@@ -79,6 +79,14 @@ completed state alone is also insufficient: the actual run must succeed and the
 associated task must reach Done. A native failure after publication fails the
 journey and retains the publication evidence already observed.
 
+The rendered check must match its exact GitHub run URL, score, and reviewed
+commit. Its failure status comes from that check's header. Hidden re-run menu
+items, a failure on another check, and words in the model's narrative do not
+prove the conclusion. `github-review-check.spec.ts` covers this boundary in the
+credential-free `test:e2e:runner:browser-support` suite. Task completion reads
+the visible Status property's picker, before and after reload. Hidden controls,
+SVG titles, and narrative text saying Done cannot satisfy that UI checkpoint.
+
 Each attempt records endpoint, App, PR/branch, task, and run ownership. Cleanup
 removes the owned endpoint, closes the owned PR/deletes its branch, and asks for
 the owned App's removal. App identity must match the created endpoint, company,
@@ -122,7 +130,10 @@ cleanup. Missing usage remains unknown. Authentication screens are excluded.
 `github-review-report.ts` uses the existing evidence sanitizer and manifest,
 stages only declared screenshots, and verifies screenshot hashes and attempt
 path ownership. The standard report inputs are `evidence/result.json`,
-`evidence/evidence-manifest.json`, and `evidence/snapshots/`. Raw private operator
+`evidence/evidence-manifest.json`, and `evidence/snapshots/`. A passing result
+also stages the hash-verified persisted checkpoint as `evidence/final-state.png`
+for the standard report's final-state requirement. A missing persisted screenshot
+rejects that passing report. Raw private operator
 receipts are outside the manifest. Existing report tooling imports these files;
 no second runner or report service is required. A presentation repair must use a
 new directory, preserve the original result/hash and failure, and dispatch no

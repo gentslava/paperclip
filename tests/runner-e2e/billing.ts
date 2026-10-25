@@ -278,8 +278,11 @@ export function summarizeExecutionBilling(
   result: Pick<
     RunnerE2EResult,
     "runIds" | "usage" | "environmentId" | "durationMs" | "runtimeUsage" | "firstTaskQuality" | "completionQuality" | "publicMcp" | "productJourney"
-  > & Partial<Pick<RunnerE2EResult, "runtimeMode">>,
+  > & Partial<Pick<RunnerE2EResult, "runtimeMode" | "billing">>,
 ): RunnerE2EBillingSummary {
+  // Some retained journeys store their measured summary without raw run usage.
+  // Regeneration must preserve those measurements, including unknown prices.
+  if (result.usage === undefined && result.billing) return structuredClone(result.billing);
   const browserOnly = Boolean(result.productJourney && result.runtimeMode === "none" && !result.runIds?.length);
   const requestedRunCount = browserOnly ? 0 : Math.max(result.runIds?.length ?? 0, 1);
   const entries = browserOnly ? [] : usageEntries(result.usage, requestedRunCount);

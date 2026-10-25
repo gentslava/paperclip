@@ -354,6 +354,18 @@ const heartbeatRunLogAccessColumns = {
   logRef: heartbeatRuns.logRef,
 } as const;
 
+const heartbeatRunIssueControlColumns = {
+  id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId,
+  status: heartbeatRuns.status, runtimeMode: heartbeatRuns.runtimeMode,
+  runtimeModeResolvedAt: heartbeatRuns.runtimeModeResolvedAt,
+  startedAt: heartbeatRuns.startedAt, createdAt: heartbeatRuns.createdAt,
+  contextSnapshot: sql<Record<string, unknown> | null>`case when jsonb_typeof(${heartbeatRuns.contextSnapshot}) = 'object'
+    then jsonb_build_object('issueId', ${heartbeatRuns.contextSnapshot}->'issueId') else null end`,
+  runnerProfileJson: sql<Record<string, unknown> | null>`case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object'
+    then jsonb_build_object('adapterDispatch', jsonb_build_object('adapterType', ${heartbeatRuns.runnerProfileJson}->'adapterDispatch'->'adapterType'))
+    else null end`,
+} as const;
+
 const heartbeatRunIssueSummaryColumns = {
   id: heartbeatRuns.id,
   runtimeMode: heartbeatRuns.runtimeMode,
@@ -1957,6 +1969,19 @@ export function createHeartbeatRunState(db: Db) {
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, runId))
         .limit(1);
+      return run ?? null;
+    },
+
+    getRunIssueControl: async (runId: string) => {
+      const [run] = await db.select(heartbeatRunIssueControlColumns).from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId)).limit(1);
+      return run ?? null;
+    },
+
+    getActiveRunIssueControlForAgent: async (agentId: string) => {
+      const [run] = await db.select(heartbeatRunIssueControlColumns).from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "running")))
+        .orderBy(desc(heartbeatRuns.startedAt)).limit(1);
       return run ?? null;
     },
 

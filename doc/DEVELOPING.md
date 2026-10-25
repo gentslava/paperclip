@@ -1812,6 +1812,8 @@ It owns bounded run projections, database encoding checks, task session reads an
 writes, explicit resumes, session compaction, and usage/billing helpers.
 `createHeartbeatRunState(db)` binds these operations without doing database work
 during construction. The encoding-check cache belongs to each factory instance.
+Queued-comment polling reads current issue control fields, the typed issue binding,
+and the selected adapter type. Mutation and execution paths retain their full run reads.
 `heartbeat.ts` keeps run execution and re-exports the
 existing public helpers. Keep session policy changes separate from run
 orchestration changes.

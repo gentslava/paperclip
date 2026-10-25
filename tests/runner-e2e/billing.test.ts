@@ -31,6 +31,25 @@ function result(overrides: Partial<RunnerE2EResult> = {}): RunnerE2EResult {
 }
 
 describe("runner E2E billing summaries", () => {
+  it("preserves captured token totals when a retained result has only a billing summary", () => {
+    const billing = summarizeExecutionBilling(result({ usage: {
+      inputTokens: 59_989, outputTokens: 4_974, cachedInputTokens: 488_798, costStatus: "unpriced",
+    } }));
+    const retained = result({ billing });
+    expect(summarizeExecutionBilling(retained)).toEqual(billing);
+    expect(aggregateCampaignBilling([retained])).toMatchObject({ llm: {
+      inputTokens: 59_989, outputTokens: 4_974, cachedInputTokens: 488_798,
+      runsWithTokenUsage: 1, runsWithReportedCost: 0,
+    }, testsWithCompleteBilling: 0 });
+  });
+
+  it("uses newly captured usage instead of a stale retained billing summary", () => {
+    const billing = summarizeExecutionBilling(result({ usage: { inputTokens: 100, outputTokens: 10, costStatus: "unpriced" } }));
+    const fresh = summarizeExecutionBilling(result({ billing, usage: { inputTokens: 200, outputTokens: 20, costStatus: "unpriced" } }));
+    expect(fresh.llm).toMatchObject({ inputTokens: 200, outputTokens: 20, runsWithReportedCost: 0 });
+    expect(fresh.complete).toBe(false);
+  });
+
   it("keeps missing agent time separate from attempt duration and measured zero", () => {
     const interrupted = result({ status: "failed", durationMs: 108_850 });
     expect(summarizeExecutionBilling(interrupted).runtime.agentRunDurationMs).toBeNull();

@@ -3,7 +3,7 @@ import type { GitHubTaskReview } from "../../packages/shared/src/types/chat-gith
 import type { GitHubRepositoryPage } from "../../packages/shared/src/types/chat-channels.js";
 import { ConnectionBlock, ConnectionFailure } from "./connection-config.js";
 import { ConnectionApi } from "./connection-target.js";
-import { awaitJourneyCondition, createGitHubJourneyPullRequest, enterGitHubJourneyCompany, observeGitHubHead, selectGitHubJourneyRepository, waitForGitHubRegistrationControl, type GitHubRegistrationBoundary } from "./github-review-browser.js";
+import { assertGitHubJourneyCheck, assertGitHubJourneyTaskDone, awaitJourneyCondition, createGitHubJourneyPullRequest, enterGitHubJourneyCompany, observeGitHubHead, selectGitHubJourneyRepository, waitForGitHubRegistrationControl, type GitHubRegistrationBoundary } from "./github-review-browser.js";
 import { githubCartFixture, hasOnlyOpenedAutomaticReview, matchesGitHubJourneyEnvironment, retainGitHubReview, verifyGitHubReview, verifyGitHubReviewRun, type GitHubReviewJourneyEvidence } from "./github-review-evidence.js";
 import type { GitHubReviewJourneyConfig } from "./github-review-config.js";
 import { captureOwnedGitHubApp, readOwnedGitHubReviewRuns, type GitHubJourneyResources } from "./github-review-ownership.js";
@@ -222,17 +222,20 @@ export async function runGitHubReviewFlow(input: {
     text: await inline.locator(".review-comment .comment-body").filter({ hasText: /precision|decimal|floating|cents/i }).first().innerText() };
   await inline.scrollIntoViewIfNeeded();
   await input.checkpoint("github_inline_delivery", github);
+  await input.phase("github_check_projection");
+  if (!review!.checkUrl) throw new ConnectionFailure("github_check_reference_missing");
   const checkPopup = page.context().waitForEvent("page");
   await page.getByRole("link", { name: "Check", exact: true }).click();
   const check = await checkPopup;
-  await expect(check.getByText(`${evidence.score}/5`, { exact: false }).first()).toBeVisible();
-  await expect(check.getByText(/failed/i).first()).toBeVisible();
+  await assertGitHubJourneyCheck(check, { repository: config.github.repository, url: review!.checkUrl, headSha, score: evidence.score });
   await input.checkpoint("check_projection", check);
+  await input.phase("task_done");
   await page.getByRole("link", { name: "Paperclip task", exact: true }).click();
-  await expect(page.getByText("Done", { exact: true }).first()).toBeVisible();
+  await assertGitHubJourneyTaskDone(page);
   await input.checkpoint("task_done", page);
+  await input.phase("persisted");
   await page.reload(); await github.reload();
-  await expect(page.getByText("Done", { exact: true }).first()).toBeVisible();
+  await assertGitHubJourneyTaskDone(page);
   await expect(github.getByText(`${evidence.score}/5`, { exact: false }).first()).toBeVisible();
   await input.checkpoint("persisted", page);
 }
